@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"Medical-Web-Backend/internal/adapter/postgres"
 	"Medical-Web-Backend/internal/config"
 	httptransport "Medical-Web-Backend/internal/transport/http"
 )
@@ -43,7 +44,7 @@ func NewApp(cfg config.Config) (*App, error) {
 			}
 		}
 		return map[string]any{"status": status, "dependencies": dependencies}
-	})
+	}, cfg, postgres.NewUserRepository(connectedClients.postgres))
 
 	return &App{cfg: cfg, server: server, clients: connectedClients, dependencies: dependencies}, nil
 }
@@ -52,6 +53,9 @@ func (a *App) Run() error {
 	defer func() {
 		if a.clients.redis != nil {
 			_ = a.clients.redis.Close()
+		}
+		if a.clients.postgres != nil {
+			_ = a.clients.postgres.Close()
 		}
 		if a.clients.producer != nil {
 			_ = a.clients.producer.GracefulStop()

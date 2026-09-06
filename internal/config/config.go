@@ -13,10 +13,9 @@ type Config struct {
 	App      AppConfig
 	HTTP     HTTPConfig
 	Redis    RedisConfig
-	HBase    HBaseConfig
+	Postgres PostgresConfig
 	MinIO    MinIOConfig
 	RocketMQ RocketMQConfig
-	JWT      JWTConfig
 	OTel     OTelConfig
 	Log      LogConfig
 }
@@ -38,8 +37,12 @@ type RedisConfig struct {
 	DB       int    `env:"REDIS_DB" envDefault:"0"`
 }
 
-type HBaseConfig struct {
-	Addr string `env:"HBASE_ADDR" envDefault:"localhost:9090"`
+type PostgresConfig struct {
+	Addr     string `env:"PGSQL_ADDR" envDefault:"localhost:5432"`
+	Username string `env:"PGSQL_USERNAME" envDefault:"postgres"`
+	Password string `env:"PGSQL_PASSWORD"`
+	Database string `env:"PGSQL_DATABASE" envDefault:"postgres"`
+	SSLMode  string `env:"PGSQL_SSLMODE" envDefault:"disable"`
 }
 
 type MinIOConfig struct {
@@ -56,11 +59,6 @@ type RocketMQConfig struct {
 	AccessKey string `env:"ROCKETMQ_ACCESS_KEY"`
 	SecretKey string `env:"ROCKETMQ_SECRET_KEY"`
 	Topic     string `env:"ROCKETMQ_TOPIC" envDefault:"medical_events"`
-}
-
-type JWTConfig struct {
-	Secret     string `env:"JWT_SECRET" envDefault:"change-me-in-production"`
-	Expiration int    `env:"JWT_EXPIRATION_HOURS" envDefault:"24"`
 }
 
 type OTelConfig struct {

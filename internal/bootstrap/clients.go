@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"context"
+	"database/sql"
 	"time"
 
 	rmq "github.com/apache/rocketmq-clients/golang/v5"
@@ -22,6 +23,7 @@ type clients struct {
 	redis    *redis.Client
 	minio    *minio.Client
 	producer rmq.Producer
+	postgres *sql.DB
 }
 
 func connectDependencies(cfg config.Config) (clients, map[string]dependencyState) {
@@ -30,6 +32,13 @@ func connectDependencies(cfg config.Config) (clients, map[string]dependencyState
 
 	states := make(map[string]dependencyState, 4)
 	var result clients
+	postgresDB, err := connectPostgres(ctx, cfg.Postgres)
+	if err != nil {
+		states["postgres"] = dependencyState{Error: err.Error()}
+	} else {
+		result.postgres = postgresDB
+		states["postgres"] = dependencyState{Connected: true}
+	}
 
 	redisClient := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr, Username: cfg.Redis.Username, Password: cfg.Redis.Password, DB: cfg.Redis.DB})
 	if err := redisClient.Ping(ctx).Err(); err != nil {
