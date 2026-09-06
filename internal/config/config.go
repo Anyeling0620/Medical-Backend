@@ -1,6 +1,12 @@
 package config
 
-import "github.com/caarlos0/env/v11"
+import (
+	"errors"
+	"os"
+
+	"github.com/caarlos0/env/v11"
+	"github.com/joho/godotenv"
+)
 
 // Config contains runtime settings loaded from environment variables.
 type Config struct {
@@ -47,6 +53,9 @@ type MinIOConfig struct {
 type RocketMQConfig struct {
 	Endpoint  string `env:"ROCKETMQ_ENDPOINT" envDefault:"localhost:8081"`
 	Namespace string `env:"ROCKETMQ_NAMESPACE"`
+	AccessKey string `env:"ROCKETMQ_ACCESS_KEY"`
+	SecretKey string `env:"ROCKETMQ_SECRET_KEY"`
+	Topic     string `env:"ROCKETMQ_TOPIC" envDefault:"medical_events"`
 }
 
 type JWTConfig struct {
@@ -66,6 +75,12 @@ type LogConfig struct {
 }
 
 func Load() (Config, error) {
+	// Load local development values when a .env file is present. In production,
+	// environment variables supplied by the process/container remain sufficient.
+	if err := godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return Config{}, err
+	}
+
 	var cfg Config
 	if err := env.Parse(&cfg); err != nil {
 		return Config{}, err
