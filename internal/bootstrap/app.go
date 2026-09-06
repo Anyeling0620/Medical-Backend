@@ -1,14 +1,13 @@
 package bootstrap
 
 import (
+	"Medical-Web-Backend/internal/repo"
 	"fmt"
 	"log"
 
-	"github.com/gin-gonic/gin"
-
-	"Medical-Web-Backend/internal/adapter/postgres"
 	"Medical-Web-Backend/internal/config"
 	httptransport "Medical-Web-Backend/internal/transport/http"
+	"github.com/gin-gonic/gin"
 )
 
 type App struct {
@@ -44,7 +43,10 @@ func NewApp(cfg config.Config) (*App, error) {
 			}
 		}
 		return map[string]any{"status": status, "dependencies": dependencies}
-	}, cfg, postgres.NewUserRepository(connectedClients.postgres))
+	}, cfg,
+		repo.NewPostgresUserRepository(connectedClients.postgres),
+		repo.NewRedisTokenRepository(connectedClients.redis),
+	)
 
 	return &App{cfg: cfg, server: server, clients: connectedClients, dependencies: dependencies}, nil
 }

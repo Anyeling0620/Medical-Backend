@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"os"
+	"time"
 
 	"github.com/caarlos0/env/v11"
 	"github.com/joho/godotenv"
@@ -18,6 +19,7 @@ type Config struct {
 	RocketMQ RocketMQConfig
 	OTel     OTelConfig
 	Log      LogConfig
+	Auth     AuthConfig
 }
 
 type AppConfig struct {
@@ -84,4 +86,11 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+type AuthConfig struct {
+	JWTSecret    string        `env:"JWT_SECRET" envDefault:"巴巴博一"`
+	AccessTTL    time.Duration `env:"JWT_ACCESS_TTL" envDefault:"15m"`
+	RefreshTTL   time.Duration `env:"JWT_REFRESH_TTL" envDefault:"168h"`
+	CookieSecure bool          `env:"JWT_COOKIE_SECURE" envDefault:"false"`
 }

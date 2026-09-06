@@ -1,11 +1,10 @@
 package main
 
 import (
-	"log"
-	"os"
-
 	"Medical-Web-Backend/internal/bootstrap"
 	"Medical-Web-Backend/internal/config"
+	"log"
+	"os"
 )
 
 func main() {
@@ -25,4 +24,5 @@ func main() {
 		log.Printf("run application: %v", err)
 		os.Exit(1)
 	}
+
 }
