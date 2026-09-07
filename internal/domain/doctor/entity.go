@@ -25,3 +25,17 @@ type SearchFilters struct {
 	Status      *int16
 	Order       *string
 }
+
+// DoctorDetail contains the fields returned by the doctor detail endpoint.
+type DoctorDetail struct {
+	Photo       string `json:"photo"`
+	PID         string `json:"pid"`
+	Birthday    string `json:"birthday"`
+	UUID        string `json:"uuid"`
+	Hiredate    string `json:"hiredate"`
+	Email       string `json:"email"`
+	Remark      string `json:"remark"`
+	Tag         string `json:"tag"`
+	Address     string `json:"address"`
+	Description string `json:"description"`
+}

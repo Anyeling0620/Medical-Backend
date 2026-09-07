@@ -163,3 +163,135 @@ func scanDoctor(scanner doctorScanner) (doctor.Doctor, error) {
 	}
 	return result, nil
 }
+
+func (r *PostgresDoctorRepository) FindByID(
+	ctx context.Context,
+	id int64,
+) (*doctor.DoctorDetail, error) {
+	if r == nil || r.db == nil {
+		return nil, sql.ErrConnDone
+	}
+
+	// 实际数据库字段没有使用双引号，使用参数化查询避免 SQL 注入。
+	const query = `
+SELECT photo,
+       pid,
+       birthday,
+       uuid,
+       hiredate,
+       email,
+       remark,
+       tag,
+       address,
+       description
+FROM hospital.doctor
+WHERE id = $1`
+
+	var result doctor.DoctorDetail
+
+	var photo sql.NullString
+	var pid sql.NullString
+	var birthday sql.NullTime
+	var uuid sql.NullString
+	var hiredate sql.NullTime
+	var email sql.NullString
+	var remark sql.NullString
+	var tag sql.NullString
+	var address sql.NullString
+	var description sql.NullString
+
+	err := r.db.QueryRowContext(ctx, query, id).Scan(
+		&photo,
+		&pid,
+		&birthday,
+		&uuid,
+		&hiredate,
+		&email,
+		&remark,
+		&tag,
+		&address,
+		&description,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	result.Photo = photo.String
+	result.PID = pid.String
+	result.Birthday = formatDoctorDate(birthday)
+	result.UUID = uuid.String
+	result.Hiredate = formatDoctorDate(hiredate)
+	result.Email = email.String
+	result.Remark = remark.String
+	result.Tag = tag.String
+	result.Address = address.String
+	result.Description = description.String
+
+	return &result, nil
+}
+
+func formatDoctorDate(value sql.NullTime) string {
+	if !value.Valid {
+		return ""
+	}
+
+	return value.Time.Format("2006-01-02")
+}
+func (r *PostgresDoctorRepository) ListDepts(ctx context.Context) ([]string, error) {
+	if r == nil || r.db == nil {
+		return nil, sql.ErrConnDone
+	}
+
+	const query = `
+SELECT DISTINCT name
+FROM hospital.medical_dept
+WHERE name IS NOT NULL AND name <> ''
+ORDER BY name`
+	return r.listStrings(ctx, query)
+}
+
+func (r *PostgresDoctorRepository) ListDegrees(ctx context.Context) ([]string, error) {
+	if r == nil || r.db == nil {
+		return nil, sql.ErrConnDone
+	}
+
+	const query = `
+SELECT DISTINCT degree
+FROM hospital.doctor
+WHERE degree IS NOT NULL AND degree <> ''
+ORDER BY degree`
+	return r.listStrings(ctx, query)
+}
+
+func (r *PostgresDoctorRepository) ListJobs(ctx context.Context) ([]string, error) {
+	if r == nil || r.db == nil {
+		return nil, sql.ErrConnDone
+	}
+
+	const query = `
+SELECT DISTINCT job
+FROM hospital.doctor
+WHERE job IS NOT NULL AND job <> ''
+ORDER BY job`
+	return r.listStrings(ctx, query)
+}
+
+func (r *PostgresDoctorRepository) listStrings(ctx context.Context, query string) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make([]string, 0)
+	for rows.Next() {
+		var value sql.NullString
+		if err := rows.Scan(&value); err != nil {
+			return nil, err
+		}
+		if value.Valid {
+			result = append(result, strings.TrimSpace(value.String))
+		}
+	}
+	return result, rows.Err()
+}

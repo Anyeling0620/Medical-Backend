@@ -1,7 +1,7 @@
 package http
 
 import (
-	"Medical-Web-Backend/internal/transport/http/middleware"
+	"Medical-Web-Backend/internal/utils"
 	"log"
 	"net/http"
 
@@ -9,7 +9,9 @@ import (
 
 	"Medical-Web-Backend/internal/config"
 	"Medical-Web-Backend/internal/port"
+	"Medical-Web-Backend/internal/repo"
 	"Medical-Web-Backend/internal/transport/http/handler"
+	"Medical-Web-Backend/internal/transport/http/middleware"
 	doctorservice "Medical-Web-Backend/internal/usecase/doctor"
 	userservice "Medical-Web-Backend/internal/usecase/misuser"
 )
@@ -19,7 +21,7 @@ func NewRouter(
 	cfg config.Config,
 	userRepository port.UserRepository,
 	tokenRepository port.TokenRepository,
-	doctorRepository port.DoctorRepository,
+	doctorRepository *repo.PostgresDoctorRepository,
 ) *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
@@ -60,12 +62,29 @@ func NewRouter(
 	router.POST("/login", authHandler.Login)
 	router.POST("/refresh", authHandler.Refresh)
 
-	router.Use(middleware.RequireAccessToken(service))
-	router.GET("/logout", authHandler.Logout)
+	doctorHandler := handler.NewDoctorHandlerWithMinIO(
+		doctorservice.NewService(doctorRepository),
+		utils.MinioPublicURL(cfg),
+	)
 
-	doctorHandler := handler.NewDoctorHandler(doctorservice.NewService(doctorRepository))
+	router.GET("/depts", doctorHandler.ListDepts)
+	router.GET("/degrees", doctorHandler.ListDegrees)
+	router.GET("/jobs", doctorHandler.ListJobs)
+
+	router.Use(middleware.RequireAccessToken(service))
+
+	router.GET("/logout", authHandler.Logout)
 	router.GET("/doctor/search", doctorHandler.Search)
 	router.GET("/doctor/searchCount", doctorHandler.SearchCount)
+
+	router.GET(
+		"/doctor/:id",
+		middleware.RequirePermissions(
+			userRepository,
+			[]string{"ROOT", "DOCTOR:SELECT"},
+		),
+		doctorHandler.Detail,
+	)
 
 	return router
 }
