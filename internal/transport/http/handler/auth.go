@@ -75,9 +75,10 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 }
 
 func (h *AuthHandler) Logout(c *gin.Context) {
-	accessToken := bearerToken(
-		c.GetHeader("Authorization"),
-	)
+	accessToken := bearerToken(c.GetHeader("Authorization"))
+	if accessToken == "" {
+		accessToken, _ = c.Cookie(userservice.AccessCookieName)
+	}
 
 	refreshToken, _ := c.Cookie(
 		userservice.RefreshCookieName,
@@ -98,7 +99,7 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 	}
 
 	h.clearTokenCookies(c)
-	c.Status(http.StatusNoContent)
+	c.JSON(http.StatusOK, nil)
 }
 
 func authResponse(
