@@ -46,6 +46,7 @@ func NewApp(cfg config.Config) (*App, error) {
 	}, cfg,
 		repo.NewPostgresUserRepository(connectedClients.postgres),
 		repo.NewRedisTokenRepository(connectedClients.redis),
+		repo.NewPostgresDoctorRepository(connectedClients.postgres),
 	)
 
 	return &App{cfg: cfg, server: server, clients: connectedClients, dependencies: dependencies}, nil

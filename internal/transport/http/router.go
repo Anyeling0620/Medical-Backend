@@ -1,6 +1,7 @@
 package http
 
 import (
+	"Medical-Web-Backend/internal/transport/http/middleware"
 	"log"
 	"net/http"
 
@@ -9,7 +10,7 @@ import (
 	"Medical-Web-Backend/internal/config"
 	"Medical-Web-Backend/internal/port"
 	"Medical-Web-Backend/internal/transport/http/handler"
-	"Medical-Web-Backend/internal/transport/http/middleware"
+	doctorservice "Medical-Web-Backend/internal/usecase/doctor"
 	userservice "Medical-Web-Backend/internal/usecase/misuser"
 )
 
@@ -18,9 +19,12 @@ func NewRouter(
 	cfg config.Config,
 	userRepository port.UserRepository,
 	tokenRepository port.TokenRepository,
+	doctorRepository port.DoctorRepository,
 ) *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
+
+	router.Use(middleware.AllowLocalhostFrontend())
 
 	if err := router.SetTrustedProxies(nil); err != nil {
 		log.Printf("setup trusted proxies error: %v", err)
@@ -55,9 +59,13 @@ func NewRouter(
 
 	router.POST("/login", authHandler.Login)
 	router.POST("/refresh", authHandler.Refresh)
-	router.GET("/logout", authHandler.Logout)
 
 	router.Use(middleware.RequireAccessToken(service))
+	router.GET("/logout", authHandler.Logout)
+
+	doctorHandler := handler.NewDoctorHandler(doctorservice.NewService(doctorRepository))
+	router.GET("/doctor/search", doctorHandler.Search)
+	router.GET("/doctor/searchCount", doctorHandler.SearchCount)
 
 	return router
 }
