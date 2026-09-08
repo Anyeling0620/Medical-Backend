@@ -60,9 +60,6 @@ func (a *App) Run() error {
 		if a.clients.postgres != nil {
 			_ = a.clients.postgres.Close()
 		}
-		if a.clients.producer != nil {
-			_ = a.clients.producer.GracefulStop()
-		}
 	}()
 	return a.server.Run(fmt.Sprintf("%s:%d", a.cfg.HTTP.Host, a.cfg.HTTP.Port))
 }

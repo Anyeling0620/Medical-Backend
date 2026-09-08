@@ -3,11 +3,11 @@ package handler
 import (
 	"errors"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"Medical-Web-Backend/internal/transport/http/middleware"
 	"Medical-Web-Backend/internal/transport/http/request"
 	"Medical-Web-Backend/internal/transport/http/response"
 	userservice "Medical-Web-Backend/internal/usecase/misuser"
@@ -75,7 +75,7 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 }
 
 func (h *AuthHandler) Logout(c *gin.Context) {
-	accessToken := bearerToken(c.GetHeader("Authorization"))
+	accessToken := middleware.BearerToken(c.GetHeader("Authorization"))
 	if accessToken == "" {
 		accessToken, _ = c.Cookie(userservice.AccessCookieName)
 	}
@@ -194,15 +194,4 @@ func (h *AuthHandler) respondError(
 	c.JSON(status, gin.H{
 		"error": err.Error(),
 	})
-}
-
-func bearerToken(header string) string {
-	parts := strings.Fields(header)
-
-	if len(parts) == 2 &&
-		strings.EqualFold(parts[0], "Bearer") {
-		return parts[1]
-	}
-
-	return ""
 }

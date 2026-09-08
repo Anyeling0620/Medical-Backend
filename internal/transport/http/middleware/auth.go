@@ -58,7 +58,7 @@ func accessTokenCandidates(c *gin.Context) []string {
 
 	// 读取：
 	// Authorization: Bearer eyJ...
-	if token := bearerToken(c.GetHeader("Authorization")); token != "" {
+	if token := BearerToken(c.GetHeader("Authorization")); token != "" {
 		candidates = append(candidates, token)
 	}
 
@@ -73,7 +73,7 @@ func accessTokenCandidates(c *gin.Context) []string {
 	return candidates
 }
 
-func bearerToken(header string) string {
+func BearerToken(header string) string {
 	parts := strings.Fields(header)
 
 	if len(parts) == 2 &&

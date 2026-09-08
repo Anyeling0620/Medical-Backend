@@ -13,9 +13,5 @@ type DoctorRepository interface {
 	ListDepts(ctx context.Context) ([]string, error)
 	ListDegrees(ctx context.Context) ([]string, error)
 	ListJobs(ctx context.Context) ([]string, error)
-}
-
-// DoctorDetailRepository contains the optional doctor detail operation.
-type DoctorDetailRepository interface {
 	FindByID(ctx context.Context, id int64) (*doctor.DoctorDetail, error)
 }

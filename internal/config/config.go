@@ -16,15 +16,11 @@ type Config struct {
 	Redis    RedisConfig
 	Postgres PostgresConfig
 	MinIO    MinIOConfig
-	RocketMQ RocketMQConfig
-	OTel     OTelConfig
-	Log      LogConfig
 	Auth     AuthConfig
 }
 
 type AppConfig struct {
-	Name string `env:"APP_NAME" envDefault:"medical-backend"`
-	Env  string `env:"APP_ENV" envDefault:"development"`
+	Env string `env:"APP_ENV" envDefault:"development"`
 }
 
 type HTTPConfig struct {
@@ -48,30 +44,9 @@ type PostgresConfig struct {
 }
 
 type MinIOConfig struct {
-	Endpoint  string `env:"MINIO_ENDPOINT" envDefault:"localhost:9000"`
-	AccessKey string `env:"MINIO_ACCESS_KEY"`
-	SecretKey string `env:"MINIO_SECRET_KEY"`
-	UseSSL    bool   `env:"MINIO_USE_SSL" envDefault:"false"`
-	Bucket    string `env:"MINIO_BUCKET" envDefault:"medical"`
-}
-
-type RocketMQConfig struct {
-	Endpoint  string `env:"ROCKETMQ_ENDPOINT" envDefault:"localhost:8081"`
-	Namespace string `env:"ROCKETMQ_NAMESPACE"`
-	AccessKey string `env:"ROCKETMQ_ACCESS_KEY"`
-	SecretKey string `env:"ROCKETMQ_SECRET_KEY"`
-	Topic     string `env:"ROCKETMQ_TOPIC" envDefault:"medical_events"`
-}
-
-type OTelConfig struct {
-	Endpoint string `env:"OTEL_EXPORTER_OTLP_ENDPOINT" envDefault:"localhost:4317"`
-	Service  string `env:"OTEL_SERVICE_NAME" envDefault:"medical-backend"`
-	Enabled  bool   `env:"OTEL_ENABLED" envDefault:"false"`
-}
-
-type LogConfig struct {
-	Level  string `env:"LOG_LEVEL" envDefault:"info"`
-	Format string `env:"LOG_FORMAT" envDefault:"json"`
+	Endpoint string `env:"MINIO_ENDPOINT" envDefault:"localhost:9000"`
+	UseSSL   bool   `env:"MINIO_USE_SSL" envDefault:"false"`
+	Bucket   string `env:"MINIO_BUCKET" envDefault:"medical"`
 }
 
 func Load() (Config, error) {

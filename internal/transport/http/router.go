@@ -1,7 +1,6 @@
 package http
 
 import (
-	"Medical-Web-Backend/internal/utils"
 	"log"
 	"net/http"
 
@@ -12,8 +11,8 @@ import (
 	"Medical-Web-Backend/internal/repo"
 	"Medical-Web-Backend/internal/transport/http/handler"
 	"Medical-Web-Backend/internal/transport/http/middleware"
-	doctorservice "Medical-Web-Backend/internal/usecase/doctor"
 	userservice "Medical-Web-Backend/internal/usecase/misuser"
+	"Medical-Web-Backend/internal/utils"
 )
 
 func NewRouter(
@@ -62,10 +61,7 @@ func NewRouter(
 	router.POST("/login", authHandler.Login)
 	router.POST("/refresh", authHandler.Refresh)
 
-	doctorHandler := handler.NewDoctorHandlerWithMinIO(
-		doctorservice.NewService(doctorRepository),
-		utils.MinioPublicURL(cfg),
-	)
+	doctorHandler := handler.NewDoctorHandler(doctorRepository, utils.MinioPublicURL(cfg))
 
 	router.GET("/depts", doctorHandler.ListDepts)
 	router.GET("/degrees", doctorHandler.ListDegrees)

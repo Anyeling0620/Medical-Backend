@@ -11,10 +11,8 @@ medical-backend/
 │   │
 │   ├── bootstrap/
 │   │   ├── app.go
-│   │   ├── pgsql.go
-│   │   ├── redis.go
-│   │   ├── minio.go
-│   │   └── rocketmq.go
+│   │   ├── clients.go
+│   │   └── pgsql.go
 │   │
 │   ├── domain/
 │   │   ├── user/
@@ -85,7 +83,7 @@ medical-backend/
 | response/       | 定义返回格式                                    |
 | middleware/     | 处理认证、日志、限流等公共逻辑                           |
 | usecase/        | 处理业务流程                                    |
-| adapter/        | 访问 PostgreSQL、Redis、MinIO、RocketMQ 和外部 HTTP 服务 |
+| repo/           | 访问 PostgreSQL 和 Redis |
 
 # 推荐使用的库
 | 用途 | 推荐库 | 说明                    |
@@ -95,9 +93,7 @@ medical-backend/
 | 日志 | 标准库 log/slog | Go 原生结构化日志            |
 | 参数校验 | github.com/go-playground/validator/v10 | Gin 生态常用              |
 | Redis | github.com/redis/go-redis/v9 | 官方社区主流客户端             |
-| MinIO | github.com/minio/minio-go/v7 | S3/MinIO 官方 Go SDK    |
 | PostgreSQL | github.com/jackc/pgx/v5 | PostgreSQL 驱动与客户端    |
-| RocketMQ 5 | github.com/apache/rocketmq-clients/golang/v5 | RocketMQ 5.x gRPC 客户端 |
 | gRPC | google.golang.org/grpc | 如果 Go 服务需要提供或调用 gRPC  |
 | Protobuf | google.golang.org/protobuf | gRPC 消息定义             |
 | JWT | github.com/golang-jwt/jwt/v5 | JWT 生成和校验             |

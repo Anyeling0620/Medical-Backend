@@ -2,41 +2,27 @@ package handler
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/binary"
 	"errors"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"Medical-Web-Backend/internal/port"
 	"Medical-Web-Backend/internal/transport/http/request"
-	doctorservice "Medical-Web-Backend/internal/usecase/doctor"
 )
 
 // DoctorHandler exposes doctor search endpoints.
 type DoctorHandler struct {
-	service  *doctorservice.Service
-	minioURL string
+	repository port.DoctorRepository
+	minioURL   string
 }
 
-func NewDoctorHandler(service *doctorservice.Service) *DoctorHandler {
-	return &DoctorHandler{
-		service: service,
-	}
-}
-
-// NewDoctorHandlerWithMinIO creates a doctor handler that resolves the
-// relative photo path stored in the database to a MinIO URL.
-func NewDoctorHandlerWithMinIO(
-	service *doctorservice.Service,
-	minioURL string,
-) *DoctorHandler {
-	return &DoctorHandler{
-		service:  service,
-		minioURL: strings.TrimRight(minioURL, "/"),
-	}
+func NewDoctorHandler(repository port.DoctorRepository, minioURL string) *DoctorHandler {
+	return &DoctorHandler{repository: repository, minioURL: strings.TrimRight(minioURL, "/")}
 }
 
 func (h *DoctorHandler) Search(c *gin.Context) {
@@ -54,13 +40,13 @@ func (h *DoctorHandler) Search(c *gin.Context) {
 		})
 		return
 	}
+	if *req.Page-1 > int(^uint(0)>>1) / *req.Length {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "page内容不正确"})
+		return
+	}
 
-	result, err := h.service.Search(
-		c.Request.Context(),
-		req.Filters(),
-		*req.Page,
-		*req.Length,
-	)
+	offset := (*req.Page - 1) * *req.Length
+	result, err := h.repository.Search(c.Request.Context(), req.Filters(), offset, *req.Length)
 	if err != nil {
 		h.respondError(c, err)
 		return
@@ -85,10 +71,7 @@ func (h *DoctorHandler) SearchCount(c *gin.Context) {
 		return
 	}
 
-	count, err := h.service.Count(
-		c.Request.Context(),
-		req.Filters(),
-	)
+	count, err := h.repository.Count(c.Request.Context(), req.Filters())
 	if err != nil {
 		h.respondError(c, err)
 		return
@@ -98,7 +81,7 @@ func (h *DoctorHandler) SearchCount(c *gin.Context) {
 }
 
 func (h *DoctorHandler) ListDepts(c *gin.Context) {
-	result, err := h.service.ListDepts(c.Request.Context())
+	result, err := h.repository.ListDepts(c.Request.Context())
 	if err != nil {
 		h.respondError(c, err)
 		return
@@ -108,7 +91,7 @@ func (h *DoctorHandler) ListDepts(c *gin.Context) {
 }
 
 func (h *DoctorHandler) ListDegrees(c *gin.Context) {
-	result, err := h.service.ListDegrees(c.Request.Context())
+	result, err := h.repository.ListDegrees(c.Request.Context())
 	if err != nil {
 		h.respondError(c, err)
 		return
@@ -118,7 +101,7 @@ func (h *DoctorHandler) ListDegrees(c *gin.Context) {
 }
 
 func (h *DoctorHandler) ListJobs(c *gin.Context) {
-	result, err := h.service.ListJobs(c.Request.Context())
+	result, err := h.repository.ListJobs(c.Request.Context())
 	if err != nil {
 		h.respondError(c, err)
 		return
@@ -136,17 +119,15 @@ func (h *DoctorHandler) Detail(c *gin.Context) {
 		return
 	}
 
-	detail, err := h.service.FindByID(
-		c.Request.Context(),
-		id,
-	)
+	detail, err := h.repository.FindByID(c.Request.Context(), id)
+	if errors.Is(err, sql.ErrNoRows) || detail == nil {
+		h.respondError(c, errDoctorNotFound)
+		return
+	}
 	if err != nil {
 		h.respondError(c, err)
 		return
 	}
-
-	// The database stores a relative path. Convert it to a MinIO URL only
-	// when returning the doctor detail response.
 	detail.Photo = h.photoURL(detail.Photo)
 
 	c.JSON(http.StatusOK, detail)
@@ -157,41 +138,20 @@ func (h *DoctorHandler) photoURL(photo string) string {
 		return photo
 	}
 
-	photoPath := strings.TrimLeft(photo, "/")
-
 	var randomBytes [8]byte
 	if _, err := rand.Read(randomBytes[:]); err == nil {
-		randomValue := binary.BigEndian.Uint64(randomBytes[:])
-
-		return h.minioURL +
-			"/" +
-			photoPath +
-			"?random=" +
-			strconv.FormatUint(randomValue, 10)
+		return h.minioURL + "/" + strings.TrimLeft(photo, "/") + "?random=" + strconv.FormatUint(binary.BigEndian.Uint64(randomBytes[:]), 10)
 	}
-
-	// Extremely unlikely fallback when the system random source is unavailable.
-	return h.minioURL +
-		"/" +
-		photoPath +
-		"?random=" +
-		strconv.FormatInt(time.Now().UnixNano(), 10)
+	return h.minioURL + "/" + strings.TrimLeft(photo, "/")
 }
 
 func (h *DoctorHandler) respondError(
 	c *gin.Context,
 	err error,
 ) {
-	if errors.Is(err, doctorservice.ErrInvalidInput) {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": err.Error(),
-		})
-		return
-	}
-
-	if errors.Is(err, doctorservice.ErrNotFound) {
+	if errors.Is(err, errDoctorNotFound) {
 		c.JSON(http.StatusNotFound, gin.H{
-			"error": err.Error(),
+			"error": "医生不存在",
 		})
 		return
 	}
@@ -200,3 +160,5 @@ func (h *DoctorHandler) respondError(
 		"error": "查询医生失败",
 	})
 }
+
+var errDoctorNotFound = errors.New("doctor not found")
