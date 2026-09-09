@@ -247,6 +247,10 @@ func mapServiceError(err error) error {
 	if errors.Is(err, schedule.ErrMaximumBelowUsed) {
 		return &ServiceError{Code: CodePlanConflict, Message: "最大号源不能小于已使用号源"}
 	}
+	// TxDeletePlan 在加锁后重跑挂号检查命中时返回领域错误，按契约仍映射为 409 而非 500。
+	if errors.Is(err, schedule.ErrHasRegistrations) {
+		return &ServiceError{Code: CodeHasRegistrations, Message: "已有挂号记录，不能删除排班"}
+	}
 	return err
 }
 

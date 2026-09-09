@@ -200,9 +200,12 @@ WHERE doctor_id=$1 AND dept_sub_id=$2)`, doctorID, subdepartmentID).Scan(&associ
 }
 
 // TxDeletePlan 物理删除计划并级联删除其 slots（表结构无级联外键时显式先删 slots）。
-// 删除子时段前先对子时段逐行 SELECT ... FOR UPDATE，串行化并发的挂号写入：挂号事务若对
-// 时段行加锁会在本事务持有行锁期间等待，从而消除 READ COMMITTED 下 TxHasRegistrations 的
-// EXISTS 错过未提交并发挂号事务的理论窗口。
+// use case 在进入本方法前已先通过 TxHasRegistrations 做过一次挂号检查，但该检查发生在加锁
+// 之前，仍存在“并发挂号在检查后、本事务加锁前提交”的理论窗口。因此这里先对子时段逐行
+// SELECT ... FOR UPDATE 串行化并发的挂号写入，再在持有行锁的状态下重跑一次挂号检查：若加锁
+// 期间已有新的挂号提交则返回 ErrHasRegistrations 中止删除，从而把窗口收敛到加锁时刻。
+// 说明：该增强依赖“挂号写入会对所引用计划/时段行加行级锁”的假设；本仓库无法验证挂号写入
+// 的实际锁序，若挂号写入未取此类行锁，仍无法完全封闭该窗口，属已知取舍。
 func (t *postgresScheduleTx) TxDeletePlan(ctx context.Context, planID int64) error {
 	rows, err := t.tx.QueryContext(ctx, "SELECT id FROM hospital.doctor_work_plan_schedule WHERE work_plan_id=$1 FOR UPDATE", planID)
 	if err != nil {
@@ -222,6 +225,15 @@ func (t *postgresScheduleTx) TxDeletePlan(ctx context.Context, planID int64) err
 	}
 	if err := rows.Close(); err != nil {
 		return err
+	}
+	// 加锁后重跑挂号检查，关闭 use case 先做 EXISTS、再进本方法加锁之间的窗口：
+	// 若加锁前有并发挂号已提交，此处能看到并中止删除，避免破坏历史关联。
+	hasRegistrations, err := t.TxHasRegistrations(ctx, planID)
+	if err != nil {
+		return err
+	}
+	if hasRegistrations {
+		return schedule.ErrHasRegistrations
 	}
 	if _, err := t.tx.ExecContext(ctx, "DELETE FROM hospital.doctor_work_plan_schedule WHERE work_plan_id=$1", planID); err != nil {
 		return err

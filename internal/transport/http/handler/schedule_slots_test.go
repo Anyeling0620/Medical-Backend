@@ -93,13 +93,12 @@ func (m *memIdempotencyStore) Load(_ context.Context, key string) (*port.Idempot
 	return &record, nil
 }
 
-// Release 释放占位（5xx / Save 失败等未落地可重放结果的场景）。
+// Release 仅释放占位、保留可重放结果（对齐生产 Redis 语义：5xx / Save 失败等未落地结果的可重试场景）。
 func (m *memIdempotencyStore) Release(_ context.Context, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.releaseCalls++
 	delete(m.placeholders, key)
-	delete(m.records, key)
 	return nil
 }
 

@@ -102,6 +102,8 @@ func (e *scheduleIdem) claimAndRun(c *gin.Context, idemKey string, run func(ctx 
 	// 无历史结果：执行首次业务（创建/更新/删除）。
 	result := run(c.Request.Context())
 	if result == nil {
+		// 业务内部错误不会产生可重放结果：释放本次占位，避免同 key 重试被占位阻塞至 TTL 到期。
+		_ = e.store.Release(c.Request.Context(), idemKey)
 		e.writeInternal(c)
 		return
 	}
