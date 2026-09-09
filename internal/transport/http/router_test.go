@@ -115,6 +115,11 @@ func TestRouterExposesContractRoutes(t *testing.T) {
 		"POST /api/v1/schedule/plans",
 		"PATCH /api/v1/schedule/plans/:planId",
 		"DELETE /api/v1/schedule/plans/:planId",
+		// 排班时段接口（规范 5.5 节）
+		"GET /api/v1/schedule/plans/:planId/slots",
+		"POST /api/v1/schedule/plans/:planId/slots",
+		"PATCH /api/v1/schedule/slots/:slotId",
+		"DELETE /api/v1/schedule/slots/:slotId",
 	}
 
 	for _, want := range required {

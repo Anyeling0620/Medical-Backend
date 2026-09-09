@@ -40,27 +40,27 @@ type Result struct {
 	Error *ServiceError
 }
 
-// Service 编排排班计划的业务规则。所有写操作的状态规则（开始/结束锁、已用量约束、
-// 挂号保护）都在本层/领域层判定，repository 不绕过规则。
+// Service 编排排班计划与排班时段的业务规则。所有写操作的状态规则（开始/结束锁、
+// 已用量约束、挂号保护）都在本层/领域层判定，repository 不绕过规则。
 type Service struct {
-	plans port.PlanRepository
-	now   func() time.Time
+	repo port.ScheduleRepository
+	now  func() time.Time
 }
 
-// NewService 构造排班计划服务；now 为空时回退到 time.Now。
-func NewService(plans port.PlanRepository, now func() time.Time) *Service {
+// NewService 构造排班服务；now 为空时回退到当前 UTC 时间。
+func NewService(repo port.ScheduleRepository, now func() time.Time) *Service {
 	if now == nil {
-		now = time.Now
+		now = func() time.Time { return time.Now().UTC() }
 	}
-	return &Service{plans: plans, now: now}
+	return &Service{repo: repo, now: now}
 }
 
 // ListPlans 分页列出排班计划；空结果保证返回非 nil 切片以输出 items:[]。
 func (s *Service) ListPlans(ctx context.Context, f schedule.PlanFilter, page, pageSize int) ([]schedule.WorkPlan, int64, error) {
-	if s.plans == nil {
+	if s.repo == nil {
 		return make([]schedule.WorkPlan, 0), 0, errors.New("排班仓库未配置")
 	}
-	items, total, err := s.plans.ListPlans(ctx, f, (page-1)*pageSize, pageSize)
+	items, total, err := s.repo.ListPlans(ctx, f, (page-1)*pageSize, pageSize)
 	if items == nil {
 		items = make([]schedule.WorkPlan, 0)
 	}
@@ -70,7 +70,7 @@ func (s *Service) ListPlans(ctx context.Context, f schedule.PlanFilter, page, pa
 // CreatePlan 创建排班计划：领域校验与关联校验完成后，在单事务内检查重复并插入，
 // 避免并发创建绕过唯一规则（契约 1.5：状态规则在 use case/domain 层完成）。
 func (s *Service) CreatePlan(ctx context.Context, p schedule.WorkPlan) (*Result, error) {
-	if s.plans == nil {
+	if s.repo == nil {
 		return nil, errors.New("排班仓库未配置")
 	}
 	// maximum 越界校验：先于领域校验给出 <1 与 >32767 的区分文案（int16 域内仅 <1 可达，
@@ -82,7 +82,7 @@ func (s *Service) CreatePlan(ctx context.Context, p schedule.WorkPlan) (*Result,
 	if err := p.ValidateNew(s.now()); err != nil {
 		return nil, validationError(err)
 	}
-	err := s.plans.ExecTx(ctx, func(tx port.ScheduleTx) error {
+	err := s.repo.ExecTx(ctx, func(tx port.ScheduleTx) error {
 		// 事务最先对“医生/子科室/日期”创建键加咨询锁：该表没有唯一约束，READ COMMITTED 下
 		// 并发“先查后插”会同时通过检查，先用事务级锁把同创建键的插入串行化（见 ScheduleTx
 		// 的 TxLockPlanCreate 说明），再执行关联校验与查重，保证 409 判定可靠。
@@ -130,14 +130,14 @@ func (s *Service) CreatePlan(ctx context.Context, p schedule.WorkPlan) (*Result,
 // UpdatePlan 更新 maximum：事务内 FOR UPDATE 重读计划，依次判定锁状态与
 // “新值不得小于已用量”，最后条件更新并返回最新资源。
 func (s *Service) UpdatePlan(ctx context.Context, planID int64, maximum int16) (*Result, error) {
-	if s.plans == nil {
+	if s.repo == nil {
 		return nil, errors.New("排班仓库未配置")
 	}
 	if err := maximumServiceError(maximum); err != nil {
 		return nil, err
 	}
 	var updated *schedule.WorkPlan
-	err := s.plans.ExecTx(ctx, func(tx port.ScheduleTx) error {
+	err := s.repo.ExecTx(ctx, func(tx port.ScheduleTx) error {
 		plan, err := tx.TxFindPlanLocked(ctx, planID)
 		if err != nil {
 			return err
@@ -166,10 +166,10 @@ func (s *Service) UpdatePlan(ctx context.Context, planID int64, maximum int16) (
 
 // DeletePlan 物理删除排班计划：已开始/已结束或计划及其 slots 存在挂号记录时拒绝删除。
 func (s *Service) DeletePlan(ctx context.Context, planID int64) error {
-	if s.plans == nil {
+	if s.repo == nil {
 		return errors.New("排班仓库未配置")
 	}
-	err := s.plans.ExecTx(ctx, func(tx port.ScheduleTx) error {
+	err := s.repo.ExecTx(ctx, func(tx port.ScheduleTx) error {
 		plan, err := tx.TxFindPlanLocked(ctx, planID)
 		if err != nil {
 			return err
@@ -248,4 +248,56 @@ func mapServiceError(err error) error {
 		return &ServiceError{Code: CodePlanConflict, Message: "最大号源不能小于已使用号源"}
 	}
 	return err
+}
+
+// ListSlotsByPlan 返回某计划全部时段；计划不存在时返回 ErrPlanNotFound
+// （由 repository 在同一查询内完成存在性判定与列表读取）。
+func (s *Service) ListSlotsByPlan(ctx context.Context, planID int64) ([]schedule.ScheduleSlot, error) {
+	if planID < 1 {
+		return nil, schedule.ErrInvalidWorkPlan
+	}
+	if s == nil || s.repo == nil {
+		return nil, schedule.ErrInvalidWorkPlan
+	}
+	items, err := s.repo.ListSlotsByPlan(ctx, planID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range items {
+		items[i].Recalculate()
+	}
+	return items, nil
+}
+
+// CreateSlot 创建时段：计划不存在返回 ErrPlanNotFound；重复时段返回 ErrSlotExists；
+// 已开始计划返回 ErrSlotLocked。成功返回含 remaining 的资源对象。
+func (s *Service) CreateSlot(ctx context.Context, input schedule.ScheduleSlot) (*schedule.ScheduleSlot, error) {
+	if s == nil || s.repo == nil {
+		return nil, schedule.ErrInvalidWorkPlan
+	}
+	return s.repo.CreateSlot(ctx, input, s.now())
+}
+
+// UpdateSlotMaximum 修改时段容量。
+// 时段不存在返回 ErrSlotNotFound；计划已开始或已有挂号返回 ErrSlotLocked；
+// 容量小于已用返回 ErrMaximumBelowUsed。
+func (s *Service) UpdateSlotMaximum(ctx context.Context, slotID int64, maximum int16) (*schedule.ScheduleSlot, error) {
+	if slotID < 1 {
+		return nil, schedule.ErrInvalidSlot
+	}
+	if s == nil || s.repo == nil {
+		return nil, schedule.ErrInvalidWorkPlan
+	}
+	return s.repo.UpdateSlotMaximum(ctx, slotID, maximum, s.now())
+}
+
+// DeleteSlot 物理删除时段：仅允许无挂号且所属计划未开始的时段。
+func (s *Service) DeleteSlot(ctx context.Context, slotID int64) error {
+	if slotID < 1 {
+		return schedule.ErrInvalidSlot
+	}
+	if s == nil || s.repo == nil {
+		return schedule.ErrInvalidWorkPlan
+	}
+	return s.repo.DeleteSlot(ctx, slotID, s.now())
 }

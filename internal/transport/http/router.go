@@ -22,29 +22,21 @@ func NewRouter(
 	userRepository port.UserRepository,
 	tokenRepository port.TokenRepository,
 	doctorRepository *repo.PostgresDoctorRepository,
-	scheduleRepository port.PlanRepository,
+	scheduleRepository *repo.PostgresScheduleRepository,
 	idempotencyStore port.IdempotencyStore,
 ) *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
-
 	router.Use(middleware.AllowLocalhostFrontend())
-
 	if err := router.SetTrustedProxies(nil); err != nil {
 		log.Printf("setup trusted proxies error: %v", err)
 	}
-
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, health())
 	})
-
 	router.GET("/", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"service": "medical-backend",
-			"status":  "ok",
-		})
+		c.JSON(http.StatusOK, gin.H{"service": "medical-backend", "status": "ok"})
 	})
-
 	service := userservice.NewService(
 		userRepository,
 		tokenRepository,
@@ -55,26 +47,16 @@ func NewRouter(
 			CookieSecure: cfg.Auth.CookieSecure,
 		},
 	)
-
-	authHandler := handler.NewAuthHandler(
-		service,
-		cfg.Auth.CookieSecure,
-	)
-
-	// 认证接口统一挂在 /api/v1/mis/auth 下，logout 不经过 RequireAccessToken，
-	// 以便支持“access token 已过期但携带 refresh token”的清理场景。
+	authHandler := handler.NewAuthHandler(service, cfg.Auth.CookieSecure)
 	authRoutes := router.Group("/api/v1/mis/auth")
 	authRoutes.POST("/login", authHandler.Login)
 	authRoutes.POST("/refresh", authHandler.Refresh)
 	authRoutes.POST("/logout", authHandler.Logout)
-
 	catalogHandler := handler.NewCatalogHandler(doctorRepository, userRepository, utils.MinioPublicURL(cfg))
-
 	scheduleService := scheduleservice.NewService(scheduleRepository, nil)
 	scheduleHandler := handler.NewScheduleHandler(scheduleService, idempotencyStore)
-
+	scheduleSlotHandler := handler.NewScheduleSlotHandler(scheduleService, idempotencyStore)
 	router.Use(middleware.RequireAccessToken(service))
-
 	catalogRoutes := router.Group("/api/v1/catalog")
 	catalogRoutes.Use(middleware.RequirePermissions(userRepository, []string{"ROOT", "CATALOG:SELECT"}))
 	catalogRoutes.GET("/departments", catalogHandler.ListDepartments)
@@ -86,16 +68,21 @@ func NewRouter(
 	catalogRoutes.GET("/doctors/:doctorId", catalogHandler.DoctorDetail)
 	catalogRoutes.GET("/doctor-prices", catalogHandler.DoctorPrices)
 
-	// 排班计划：查询走 SCHEDULE:SELECT，写操作走 SCHEDULE:WRITE（均允许 ROOT）。
+	// 排班：查询走 SCHEDULE:SELECT，写操作走 SCHEDULE:WRITE（均允许 ROOT）。
+	// 计划接口在前，时段接口复用同一服务实例；两类接口共用 SCHEDULE:SELECT/WRITE 权限。
 	scheduleSelectRoutes := router.Group("/api/v1/schedule")
 	scheduleSelectRoutes.Use(middleware.RequirePermissions(userRepository, []string{"ROOT", "SCHEDULE:SELECT"}))
 	scheduleSelectRoutes.GET("/plans", scheduleHandler.ListPlans)
+	scheduleSelectRoutes.GET("/plans/:planId/slots", scheduleSlotHandler.ListSlots)
 
 	scheduleWriteRoutes := router.Group("/api/v1/schedule")
 	scheduleWriteRoutes.Use(middleware.RequirePermissions(userRepository, []string{"ROOT", "SCHEDULE:WRITE"}))
 	scheduleWriteRoutes.POST("/plans", scheduleHandler.CreatePlan)
 	scheduleWriteRoutes.PATCH("/plans/:planId", scheduleHandler.UpdatePlan)
 	scheduleWriteRoutes.DELETE("/plans/:planId", scheduleHandler.DeletePlan)
+	scheduleWriteRoutes.POST("/plans/:planId/slots", scheduleSlotHandler.CreateSlot)
+	scheduleWriteRoutes.PATCH("/slots/:slotId", scheduleSlotHandler.UpdateSlotMaximum)
+	scheduleWriteRoutes.DELETE("/slots/:slotId", scheduleSlotHandler.DeleteSlot)
 
 	return router
 }

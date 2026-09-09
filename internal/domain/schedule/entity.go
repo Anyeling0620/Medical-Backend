@@ -22,6 +22,12 @@ var (
 	ErrHasRegistrations = errors.New("schedule resource has registrations and cannot be deleted")
 	// ErrPlanExists 用于同一医生/子科室/日期重复创建排班计划。
 	ErrPlanExists = errors.New("schedule plan already exists for the doctor, subdepartment and date")
+	// ErrPlanNotFound 表示排班计划不存在（404 SCHEDULE_PLAN_NOT_FOUND）。
+	ErrPlanNotFound = errors.New("schedule plan not found")
+	// ErrSlotNotFound 表示时段不存在（404 SCHEDULE_SLOT_NOT_FOUND）。
+	ErrSlotNotFound = errors.New("schedule slot not found")
+	// ErrSlotExists 表示同一计划下时段编号重复（409 SCHEDULE_SLOT_EXISTS）。
+	ErrSlotExists = errors.New("schedule slot already exists")
 )
 
 // PlanFilter 是排班计划列表的查询条件与排序参数。
@@ -199,7 +205,23 @@ func (s ScheduleSlot) ValidateDelete(plan WorkPlan, now time.Time) error {
 	return nil
 }
 
+// MaximumBelowUsedError 表示新容量小于当前已用号源，携带 used 供 409 响应 details 展示。
+type MaximumBelowUsedError struct{ Used int16 }
+
+func (e *MaximumBelowUsedError) Error() string {
+	return ErrMaximumBelowUsed.Error()
+}
+func (e *MaximumBelowUsedError) Unwrap() error { return ErrMaximumBelowUsed }
+
+// businessLocation 是排班业务的日历时区。排班日期按医院所在地（Asia/Shanghai）的
+// 日历日判定是否“已开始/已结束”，不能使用 UTC 日界：若按 UTC 截断，
+// 上海每天 00:00-08:00 会把“当天已开始的计划”误判为未来计划而放行写操作。
+// 使用固定 +08:00 偏移，避免依赖部署环境是否安装时区数据库。
+var businessLocation = time.FixedZone("Asia/Shanghai", 8*60*60)
+
+// dateOnly 把任意时刻归一到“业务日期”对应的 UTC 零点：
+// 先按 Asia/Shanghai 取日历日，再构造 UTC 零点便于与 ParsedDate（UTC 零点）比较。
 func dateOnly(value time.Time) time.Time {
-	year, month, day := value.In(time.UTC).Date()
+	year, month, day := value.In(businessLocation).Date()
 	return time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
 }

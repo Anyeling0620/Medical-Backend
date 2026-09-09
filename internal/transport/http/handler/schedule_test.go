@@ -850,3 +850,21 @@ func TestScheduleUpdateDeleteWithoutIdempotencyKey(t *testing.T) {
 		t.Errorf("204 不应有响应体: %q", w.Body.String())
 	}
 }
+
+// --- ScheduleSlotRepository 适配桩（plans handler 单测不调用时段方法，仅满足组合接口）---
+
+func (f *fakeSchedulePlanRepo) ListSlotsByPlan(_ context.Context, planID int64) ([]schedule.ScheduleSlot, error) {
+	return nil, schedule.ErrPlanNotFound
+}
+
+func (f *fakeSchedulePlanRepo) CreateSlot(_ context.Context, slot schedule.ScheduleSlot, _ time.Time) (*schedule.ScheduleSlot, error) {
+	return nil, schedule.ErrInvalidWorkPlan
+}
+
+func (f *fakeSchedulePlanRepo) UpdateSlotMaximum(_ context.Context, slotID int64, maximum int16, _ time.Time) (*schedule.ScheduleSlot, error) {
+	return nil, schedule.ErrSlotNotFound
+}
+
+func (f *fakeSchedulePlanRepo) DeleteSlot(_ context.Context, slotID int64, _ time.Time) error {
+	return schedule.ErrSlotNotFound
+}
