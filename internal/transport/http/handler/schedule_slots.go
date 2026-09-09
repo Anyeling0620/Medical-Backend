@@ -4,20 +4,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"Medical-Web-Backend/internal/domain/schedule"
 	"Medical-Web-Backend/internal/port"
-	"Medical-Web-Backend/internal/transport/http/middleware"
 	"Medical-Web-Backend/internal/transport/http/request"
-	misuser "Medical-Web-Backend/internal/usecase/misuser"
 	scheduleservice "Medical-Web-Backend/internal/usecase/schedule"
 )
 
@@ -28,12 +23,13 @@ import (
 // repository 事务内完成，handler 只负责参数解析与错误码/文案映射。
 type ScheduleSlotHandler struct {
 	service *scheduleservice.Service
-	store   port.IdempotencyStore
+	// 幂等协调（Claim 原子占位 + 结果重放）复用 schedule_idem.go 的共享实现。
+	*scheduleIdem
 }
 
 // NewScheduleSlotHandler 构造排班时段处理器；store 为创建接口的幂等存储（Redis）。
 func NewScheduleSlotHandler(service *scheduleservice.Service, store port.IdempotencyStore) *ScheduleSlotHandler {
-	return &ScheduleSlotHandler{service: service, store: store}
+	return &ScheduleSlotHandler{service: service, scheduleIdem: newScheduleIdem(store)}
 }
 
 // ListSlots GET /api/v1/schedule/plans/{planId}/slots：返回按 slot 升序的时段数组。
@@ -64,8 +60,8 @@ func (h *ScheduleSlotHandler) CreateSlot(c *gin.Context) {
 		h.writeResult(c, h.validationResult(err))
 		return
 	}
-	userID, err := h.currentUser(c)
-	if err != nil {
+	userID, authErr := currentUserID(c)
+	if authErr != nil {
 		h.writeResult(c, h.authResult())
 		return
 	}
@@ -130,92 +126,6 @@ func (h *ScheduleSlotHandler) DeleteSlot(c *gin.Context) {
 	h.writeResult(c, &opResult{status: http.StatusNoContent})
 }
 
-// claimAndRun 实现“占位 -> 重放 -> 执行业务 -> 保存”的幂等协调流程（与 plans 分支一致）：
-// Redis 不可用返回 503；同 key 重复请求原样重放第一次结果（成功与业务错误都重放）；
-// 首次请求执行期间到达的并发重复在短暂轮询无果后返回 409，由客户端稍后重试。
-func (h *ScheduleSlotHandler) claimAndRun(c *gin.Context, idemKey string, run func(ctx context.Context) *opResult) {
-	if h.store == nil {
-		h.writeResult(c, h.idempotencyUnavailableResult())
-		return
-	}
-	claimed, err := h.store.Claim(c.Request.Context(), idemKey)
-	if err != nil {
-		h.writeResult(c, h.idempotencyUnavailableResult())
-		return
-	}
-	if !claimed {
-		// 未抢到占位：重放已保存的第一次结果；短暂等待后仍无结果则按冲突处理。
-		for attempt := 0; attempt < 6; attempt++ {
-			record, loadErr := h.store.Load(c.Request.Context(), idemKey)
-			if loadErr != nil {
-				h.writeResult(c, h.idempotencyUnavailableResult())
-				return
-			}
-			if record != nil {
-				h.replay(c, record)
-				return
-			}
-			if attempt < 5 {
-				time.Sleep(20 * time.Millisecond)
-			}
-		}
-		h.writeResult(c, h.errResult(http.StatusConflict, "SCHEDULE_CONFLICT", "排班时段请求正在处理中，请稍后重试"))
-		return
-	}
-	// 抢到占位：执行首次业务（创建）。
-	result := run(c.Request.Context())
-	if result == nil {
-		h.writeResult(c, h.internalResult())
-		return
-	}
-	// 5xx 不入幂等存储，允许网络超时后客户端重试并重新创建。
-	if result.status >= 500 {
-		h.writeResult(c, result)
-		// 释放占位键，避免后续重试被 24h 占位挡住。
-		_ = h.store.Release(c.Request.Context(), idemKey)
-		return
-	}
-	// 业务成功（或业务错误如 409/404/422）：保存结果后原样重放给并发重复请求。
-	if saveErr := h.store.Save(c.Request.Context(), idemKey, port.IdempotencyRecord{
-		StatusCode: result.status,
-		Headers:    result.headers,
-		Body:       marshalBody(result.body),
-	}); saveErr != nil {
-		// 业务已执行无法回滚：释放占位并返回真实结果；客户端重试时走重新执行业务的路径。
-		_ = h.store.Release(c.Request.Context(), idemKey)
-	}
-	h.writeResult(c, result)
-}
-
-// replay 按保存的第一次结果原样重放响应。
-func (h *ScheduleSlotHandler) replay(c *gin.Context, record *port.IdempotencyRecord) {
-	for name, value := range record.Headers {
-		c.Header(name, value)
-	}
-	if len(record.Body) == 0 {
-		c.Status(record.StatusCode)
-		return
-	}
-	c.Data(record.StatusCode, "application/json; charset=utf-8", record.Body)
-}
-
-// writeResult 把 opResult 写回客户端（Content-Type 与响应体序列化保持一致）。
-func (h *ScheduleSlotHandler) writeResult(c *gin.Context, result *opResult) {
-	if result == nil {
-		h.writeResult(c, h.internalResult())
-		return
-	}
-	for name, value := range result.headers {
-		c.Header(name, value)
-	}
-	body := marshalBody(result.body)
-	if len(body) == 0 {
-		c.Status(result.status)
-		return
-	}
-	c.Data(result.status, "application/json; charset=utf-8", body)
-}
-
 // parsePositiveID 解析路径参数中的正整数 ID。
 func parsePositiveID(raw string, label string) (int64, error) {
 	id, err := request.ParsePositiveID(raw)
@@ -223,16 +133,6 @@ func parsePositiveID(raw string, label string) (int64, error) {
 		return 0, errors.New(label + " 必须为正整数")
 	}
 	return id, nil
-}
-
-// currentUser 从 access token claims 中提取用户 ID，用于幂等键隔离不同操作者。
-func (h *ScheduleSlotHandler) currentUser(c *gin.Context) (int64, error) {
-	value, exists := c.Get(middleware.ClaimsKey)
-	claims, ok := value.(*misuser.AccessClaims)
-	if !exists || !ok || claims == nil {
-		return 0, errors.New("访问令牌无效或已过期")
-	}
-	return claims.UserID, nil
 }
 
 // idempotencyKey 生成幂等存储键：sha256(userId|planId|fullPath|key)。
@@ -256,14 +156,9 @@ func (h *ScheduleSlotHandler) validationResult(e error) *opResult {
 
 // bindResult 按仓库 auth 约定区分 JSON 错误：语法错误、字段类型错误与
 // 截断的 JSON（io.ErrUnexpectedEOF）返回 400 REQUEST_INVALID_JSON；
-// 空请求体、未知字段与语义错误仍走 422。
+// 空请求体、未知字段与语义错误仍走 422。复用 schedule_idem.go 的共享实现。
 func (h *ScheduleSlotHandler) bindResult(e error) *opResult {
-	var syntaxErr *json.SyntaxError
-	var typeErr *json.UnmarshalTypeError
-	if errors.As(e, &syntaxErr) || errors.As(e, &typeErr) || errors.Is(e, io.ErrUnexpectedEOF) {
-		return h.errResult(http.StatusBadRequest, "REQUEST_INVALID_JSON", "请求体不是合法的 JSON")
-	}
-	return h.validationResult(e)
+	return bindRequestResult(e, h.validationResult)
 }
 
 // opFromError 把 use case/repository 返回的领域错误映射为 HTTP 结果；
@@ -384,10 +279,3 @@ func (h *ScheduleSlotHandler) authResult() *opResult {
 func (h *ScheduleSlotHandler) internalResult() *opResult {
 	return h.errResult(http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "服务器内部错误")
 }
-
-// idempotencyUnavailableResult 返回 503 幂等存储不可用结果（不静默降级）。
-func (h *ScheduleSlotHandler) idempotencyUnavailableResult() *opResult {
-	return h.errResult(http.StatusServiceUnavailable, "IDEMPOTENCY_STORE_UNAVAILABLE", "幂等存储不可用，请稍后重试")
-}
-
-// marshalBody 把响应对象序列化为 JSON 字节（空对象不会出现，调用方仅在无 body 时传 nil）。

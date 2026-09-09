@@ -15,7 +15,9 @@ import (
 	"Medical-Web-Backend/internal/port"
 )
 
-// PostgresScheduleRepository 同时实现排班计划（plans）与排班时段（slots）的 PostgreSQL 持久化。\r\n// 计划列表/详情直接读表；计划写操作经 ExecTx 在事务内完成；时段创建、更新与删除均在事务内\r\n// 用 SELECT ... FOR UPDATE 串行化，保证同一计划下时段编号不重复、未来排班校验与容量约束原子性。
+// PostgresScheduleRepository 同时实现排班计划（plans）与排班时段（slots）的 PostgreSQL 持久化。
+// 计划列表/详情直接读表；计划写操作经 ExecTx 在事务内完成；时段创建、更新与删除均在事务内
+// 用 SELECT ... FOR UPDATE 串行化，保证同一计划下时段编号不重复、未来排班校验与容量约束原子性。
 type PostgresScheduleRepository struct {
 	db *sql.DB
 }
@@ -198,7 +200,29 @@ WHERE doctor_id=$1 AND dept_sub_id=$2)`, doctorID, subdepartmentID).Scan(&associ
 }
 
 // TxDeletePlan 物理删除计划并级联删除其 slots（表结构无级联外键时显式先删 slots）。
+// 删除子时段前先对子时段逐行 SELECT ... FOR UPDATE，串行化并发的挂号写入：挂号事务若对
+// 时段行加锁会在本事务持有行锁期间等待，从而消除 READ COMMITTED 下 TxHasRegistrations 的
+// EXISTS 错过未提交并发挂号事务的理论窗口。
 func (t *postgresScheduleTx) TxDeletePlan(ctx context.Context, planID int64) error {
+	rows, err := t.tx.QueryContext(ctx, "SELECT id FROM hospital.doctor_work_plan_schedule WHERE work_plan_id=$1 FOR UPDATE", planID)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		// 仅消费行以取得对子时段行的排他锁，行数据本删除不再需要。
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
 	if _, err := t.tx.ExecContext(ctx, "DELETE FROM hospital.doctor_work_plan_schedule WHERE work_plan_id=$1", planID); err != nil {
 		return err
 	}

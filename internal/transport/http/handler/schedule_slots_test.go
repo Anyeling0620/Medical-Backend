@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http/httptest"
@@ -302,6 +303,19 @@ func assertErrorStatus(t *testing.T, w *httptest.ResponseRecorder, status int, c
 		t.Fatalf("code = %v, want %s; body=%s", body["code"], code, w.Body.String())
 	}
 	return body
+}
+
+// decodeBody 解码响应体为 map；响应为空或非 JSON 时以 t.Fatal 中断。
+func decodeBody(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	if w.Body.Len() == 0 {
+		t.Fatalf("response body is empty; status=%d", w.Code)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil {
+		t.Fatalf("invalid JSON body: %v; body=%s", err, w.Body.String())
+	}
+	return m
 }
 
 // --- PlanRepository 适配桩（slots handler 单测不调用计划方法，仅满足组合接口）---

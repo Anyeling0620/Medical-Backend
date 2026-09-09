@@ -147,7 +147,7 @@ type CreatePlanBody struct {
 // maximum 为 1..32767。
 func BindCreatePlan(c *gin.Context) (CreatePlanBody, error) {
 	var body CreatePlanBody
-	if err := decodeJSONBody(c, &body); err != nil {
+	if err := decodeStrict(c, &body); err != nil {
 		return body, err
 	}
 	if body.DoctorID < 1 {
@@ -177,7 +177,7 @@ type UpdatePlanBody struct {
 // maximum 为 1..32767（服务层还会结合 used 校验并发约束）。
 func BindUpdatePlanMaximum(c *gin.Context) (UpdatePlanBody, error) {
 	var body UpdatePlanBody
-	if err := decodeJSONBody(c, &body); err != nil {
+	if err := decodeStrict(c, &body); err != nil {
 		return body, err
 	}
 	if body.Maximum < 1 {
@@ -226,16 +226,6 @@ func optionalDateParam(c *gin.Context, name string) (string, error) {
 		return "", errors.New(name + "格式必须为 YYYY-MM-DD")
 	}
 	return raw, nil
-}
-
-// decodeJSONBody 解析请求体：字段类型错误或未知字段由调用方统一转 422 参数错误。
-func decodeJSONBody(c *gin.Context, dst any) error {
-	if c.Request.Body == nil {
-		return errors.New("请求体不能为空")
-	}
-	decoder := json.NewDecoder(c.Request.Body)
-	decoder.DisallowUnknownFields()
-	return decoder.Decode(dst)
 }
 
 // CreateSlotRequest 对应 POST /api/v1/schedule/plans/{planId}/slots 的请求体：{slot, maximum}。

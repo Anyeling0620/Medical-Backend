@@ -70,8 +70,9 @@ func TestScheduleSlotCreateSlotReplaysSavedResult(t *testing.T) {
 	if stub.createCalls != 1 {
 		t.Errorf("重试不应再次调用 repo.CreateSlot，createCalls = %d", stub.createCalls)
 	}
-	if store.loadCalls != 1 {
-		t.Errorf("store.loadCalls = %d, want 1（重试走 Load 重放）", store.loadCalls)
+	// P1 修复后，首次请求在抢到占位时也会先 Load 一次历史结果；重试在未抢到占位时再 Load 一次并重放。
+	if store.loadCalls != 2 {
+		t.Errorf("store.loadCalls = %d, want 2（首次占位重查 + 重试 Load 重放）", store.loadCalls)
 	}
 }
 
