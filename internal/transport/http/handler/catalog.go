@@ -50,7 +50,12 @@ func (h *CatalogHandler) DoctorDetail(c *gin.Context) {
 }
 
 func (h *CatalogHandler) DoctorOptions(c *gin.Context) {
-	if c.Request.URL.Query().Get("page") != "" || c.Request.URL.Query().Get("pageSize") != "" {
+	query := c.Request.URL.Query()
+	if _, exists := query["page"]; exists {
+		h.validation(c, errors.New("不支持分页参数"))
+		return
+	}
+	if _, exists := query["pageSize"]; exists {
 		h.validation(c, errors.New("不支持分页参数"))
 		return
 	}
