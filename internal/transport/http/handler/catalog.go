@@ -14,6 +14,52 @@ type CatalogHandler struct{ repository port.CatalogRepository }
 func NewCatalogHandler(r port.CatalogRepository) *CatalogHandler {
 	return &CatalogHandler{repository: r}
 }
+
+func (h *CatalogHandler) DoctorDetail(c *gin.Context) {
+	id, err := request.ParsePositiveID(c.Param("doctorId"))
+	if err != nil {
+		h.validation(c, errors.New("医生编号必须为正整数"))
+		return
+	}
+	item, err := h.repository.FindDoctor(c.Request.Context(), id)
+	if errors.Is(err, sql.ErrNoRows) || item == nil {
+		c.JSON(404, gin.H{"code": "CATALOG_DOCTOR_NOT_FOUND", "message": "医生不存在"})
+		return
+	}
+	if err != nil {
+		h.internal(c)
+		return
+	}
+	c.JSON(200, item)
+}
+
+func (h *CatalogHandler) DoctorOptions(c *gin.Context) {
+	if c.Request.URL.Query().Get("page") != "" || c.Request.URL.Query().Get("pageSize") != "" {
+		h.validation(c, errors.New("不支持分页参数"))
+		return
+	}
+	item, err := h.repository.ListDoctorOptions(c.Request.Context())
+	if err != nil {
+		h.internal(c)
+		return
+	}
+	c.JSON(200, item)
+}
+
+func (h *CatalogHandler) DoctorPrices(c *gin.Context) {
+	r, err := request.BindDoctorPrices(c)
+	if err != nil {
+		h.validation(c, err)
+		return
+	}
+	offset := (*r.Page - 1) * (*r.PageSize)
+	items, total, err := h.repository.ListDoctorPrices(c.Request.Context(), *r.DoctorID, offset, *r.PageSize)
+	if err != nil {
+		h.internal(c)
+		return
+	}
+	c.JSON(200, catalog.Page[catalog.DoctorPrice]{Items: items, Page: *r.Page, PageSize: *r.PageSize, Total: total})
+}
 func (h *CatalogHandler) ListDepartments(c *gin.Context) {
 	r, err := request.BindDepartmentList(c)
 	if err != nil || r.Validate() != nil {

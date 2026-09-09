@@ -78,6 +78,9 @@ func NewRouter(
 	catalogRoutes.GET("/departments", catalogHandler.ListDepartments)
 	catalogRoutes.GET("/departments/:departmentId", catalogHandler.Detail)
 	catalogRoutes.GET("/departments/:departmentId/subdepartments", catalogHandler.Subdepartments)
+	catalogRoutes.GET("/doctors/options", catalogHandler.DoctorOptions)
+	catalogRoutes.GET("/doctors/:doctorId", catalogHandler.DoctorDetail)
+	catalogRoutes.GET("/doctor-prices", catalogHandler.DoctorPrices)
 
 	router.GET(
 		"/doctor/:id",
