@@ -21,14 +21,16 @@ func RequirePermissions(
 
 		if !exists || !ok || claims == nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": userservice.ErrInvalidToken.Error(),
+				"code":    "AUTH_INVALID_TOKEN",
+				"message": "访问令牌无效或已过期",
 			})
 			return
 		}
 
 		if userRepository == nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
-				"error": "权限校验失败",
+				"code":    "INTERNAL_SERVER_ERROR",
+				"message": "权限校验失败",
 			})
 			return
 		}
@@ -39,14 +41,16 @@ func RequirePermissions(
 		)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
-				"error": "权限校验失败",
+				"code":    "INTERNAL_SERVER_ERROR",
+				"message": "权限校验失败",
 			})
 			return
 		}
 
 		if !hasAllowedPermission(permissions, allowed) {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-				"error": "没有访问权限",
+				"code":    "AUTH_FORBIDDEN",
+				"message": "没有访问权限",
 			})
 			return
 		}

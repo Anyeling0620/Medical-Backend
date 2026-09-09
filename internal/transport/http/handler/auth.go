@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"time"
@@ -28,12 +29,11 @@ func NewAuthHandler(
 	}
 }
 
+// Login 处理 POST /api/v1/mis/auth/login。
 func (h *AuthHandler) Login(c *gin.Context) {
 	var req request.LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": userservice.ErrInvalidInput.Error(),
-		})
+		h.bindError(c, err)
 		return
 	}
 
@@ -43,7 +43,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		req.Password,
 	)
 	if err != nil {
-		h.respondError(c, err)
+		h.loginError(c, err)
 		return
 	}
 
@@ -52,12 +52,11 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	c.JSON(http.StatusOK, authResponse(result))
 }
 
+// Refresh 处理 POST /api/v1/mis/auth/refresh，refresh token 只从 HttpOnly Cookie 读取。
 func (h *AuthHandler) Refresh(c *gin.Context) {
 	refreshToken, err := c.Cookie(userservice.RefreshCookieName)
 	if err != nil || refreshToken == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error": userservice.ErrInvalidToken.Error(),
-		})
+		h.writeError(c, http.StatusUnauthorized, "AUTH_INVALID_REFRESH_TOKEN", "刷新令牌无效或已过期")
 		return
 	}
 
@@ -66,7 +65,7 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		refreshToken,
 	)
 	if err != nil {
-		h.respondError(c, err)
+		h.writeError(c, http.StatusUnauthorized, "AUTH_INVALID_REFRESH_TOKEN", "刷新令牌无效或已过期")
 		return
 	}
 
@@ -74,6 +73,9 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 	c.JSON(http.StatusOK, authResponse(result))
 }
 
+// Logout 处理 POST /api/v1/mis/auth/logout，成功固定返回 204 No Content。
+// 不经过 RequireAccessToken：只要携带 refresh token，即使 access token 已过期
+// 也能清理会话；access token 无效/已注销按幂等成功处理；两者都没有时返回 401。
 func (h *AuthHandler) Logout(c *gin.Context) {
 	accessToken := middleware.BearerToken(c.GetHeader("Authorization"))
 	if accessToken == "" {
@@ -84,22 +86,39 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 		userservice.RefreshCookieName,
 	)
 
-	err := h.service.Logout(
+	// 优先用 refresh token 清理会话，忽略已过期或无效的 access token。
+	if refreshToken != "" {
+		if err := h.service.Logout(
+			c.Request.Context(),
+			"",
+			refreshToken,
+		); err != nil {
+			h.writeError(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "退出登录失败")
+			return
+		}
+		h.clearTokenCookies(c)
+		c.Status(http.StatusNoContent)
+		return
+	}
+
+	if accessToken == "" {
+		h.writeError(c, http.StatusUnauthorized, "AUTH_INVALID_TOKEN", "访问令牌无效")
+		return
+	}
+
+	// 仅携带 access token 时，注销已失效 token 不报错，保证 logout 幂等。
+	if err := h.service.Logout(
 		c.Request.Context(),
 		accessToken,
-		refreshToken,
-	)
-
-	if err != nil &&
+		"",
+	); err != nil &&
 		!errors.Is(err, userservice.ErrInvalidToken) {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "logout failed",
-		})
+		h.writeError(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "退出登录失败")
 		return
 	}
 
 	h.clearTokenCookies(c)
-	c.JSON(http.StatusOK, nil)
+	c.Status(http.StatusNoContent)
 }
 
 func authResponse(
@@ -107,10 +126,14 @@ func authResponse(
 ) response.LoginResponse {
 	return response.LoginResponse{
 		User: response.UserResponse{
-			ID:       result.User.ID,
-			Username: result.User.Username,
+			ID:           result.User.ID,
+			Username:     result.User.Username,
+			Name:         result.User.Name,
+			DepartmentID: result.User.DepartmentID,
+			Job:          result.User.Job,
 		},
-		Permissions: result.Permissions,
+		Permissions:     result.Permissions,
+		AccessExpiresAt: result.Tokens.AccessExpiresAt.UTC().Format(time.RFC3339),
 	}
 }
 
@@ -181,17 +204,39 @@ func cookieAge(expiresAt time.Time) int {
 	return seconds
 }
 
-func (h *AuthHandler) respondError(
-	c *gin.Context,
-	err error,
-) {
-	status := http.StatusUnauthorized
-
-	if errors.Is(err, userservice.ErrInvalidInput) {
-		status = http.StatusBadRequest
+// bindError 区分 JSON 语法错误（400）与字段缺失/类型错误（422）。
+func (h *AuthHandler) bindError(c *gin.Context, err error) {
+	var syntaxError *json.SyntaxError
+	var typeError *json.UnmarshalTypeError
+	if errors.As(err, &syntaxError) ||
+		errors.As(err, &typeError) {
+		h.writeError(c, http.StatusBadRequest, "REQUEST_INVALID_JSON", "请求体不是合法的 JSON")
+		return
 	}
+	h.writeError(c, http.StatusUnprocessableEntity, "REQUEST_VALIDATION_FAILED", "用户名和密码不能为空")
+}
 
+// loginError 把认证失败映射为契约错误码；凭据/停用用户统一 401，不区分具体原因。
+func (h *AuthHandler) loginError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, userservice.ErrInvalidCredentials),
+		errors.Is(err, userservice.ErrInactiveUser):
+		h.writeError(c, http.StatusUnauthorized, "AUTH_INVALID_CREDENTIALS", "用户名或密码错误")
+	case errors.Is(err, userservice.ErrInvalidInput):
+		h.writeError(c, http.StatusUnprocessableEntity, "REQUEST_VALIDATION_FAILED", "用户名和密码不能为空")
+	default:
+		h.writeError(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "登录失败，请稍后重试")
+	}
+}
+
+func (h *AuthHandler) writeError(
+	c *gin.Context,
+	status int,
+	code string,
+	message string,
+) {
 	c.JSON(status, gin.H{
-		"error": err.Error(),
+		"code":    code,
+		"message": message,
 	})
 }

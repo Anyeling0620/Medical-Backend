@@ -58,21 +58,17 @@ func NewRouter(
 		cfg.Auth.CookieSecure,
 	)
 
-	router.POST("/login", authHandler.Login)
-	router.POST("/refresh", authHandler.Refresh)
+	// 认证接口统一挂在 /api/v1/mis/auth 下，logout 不经过 RequireAccessToken，
+	// 以便支持“access token 已过期但携带 refresh token”的清理场景。
+	authRoutes := router.Group("/api/v1/mis/auth")
+	authRoutes.POST("/login", authHandler.Login)
+	authRoutes.POST("/refresh", authHandler.Refresh)
+	authRoutes.POST("/logout", authHandler.Logout)
 
-	doctorHandler := handler.NewDoctorHandler(doctorRepository, utils.MinioPublicURL(cfg))
 	catalogHandler := handler.NewCatalogHandler(doctorRepository, userRepository, utils.MinioPublicURL(cfg))
-
-	router.GET("/depts", doctorHandler.ListDepts)
-	router.GET("/degrees", doctorHandler.ListDegrees)
-	router.GET("/jobs", doctorHandler.ListJobs)
 
 	router.Use(middleware.RequireAccessToken(service))
 
-	router.GET("/logout", authHandler.Logout)
-	router.GET("/doctor/search", doctorHandler.Search)
-	router.GET("/doctor/searchCount", doctorHandler.SearchCount)
 	catalogRoutes := router.Group("/api/v1/catalog")
 	catalogRoutes.Use(middleware.RequirePermissions(userRepository, []string{"ROOT", "CATALOG:SELECT"}))
 	catalogRoutes.GET("/departments", catalogHandler.ListDepartments)
@@ -83,15 +79,6 @@ func NewRouter(
 	catalogRoutes.GET("/doctors/options", catalogHandler.DoctorOptions)
 	catalogRoutes.GET("/doctors/:doctorId", catalogHandler.DoctorDetail)
 	catalogRoutes.GET("/doctor-prices", catalogHandler.DoctorPrices)
-
-	router.GET(
-		"/doctor/:id",
-		middleware.RequirePermissions(
-			userRepository,
-			[]string{"ROOT", "DOCTOR:SELECT"},
-		),
-		doctorHandler.Detail,
-	)
 
 	return router
 }

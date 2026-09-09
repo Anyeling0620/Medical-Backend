@@ -22,7 +22,7 @@ func (r *PostgresUserRepository) FindByUsername(ctx context.Context, username st
 	}
 
 	const query = `
-SELECT id, username, password, COALESCE(status, 0)
+SELECT id, username, password, COALESCE(status, 0), name, dept_id, job
 FROM hospital.mis_user
 WHERE username = $1
 LIMIT 1`
@@ -36,7 +36,7 @@ func (r *PostgresUserRepository) FindByID(ctx context.Context, userID int64) (*u
 	}
 
 	const query = `
-SELECT id, username, password, COALESCE(status, 0)
+SELECT id, username, password, COALESCE(status, 0), name, dept_id, job
 FROM hospital.mis_user
 WHERE id = $1
 LIMIT 1`
@@ -46,13 +46,28 @@ LIMIT 1`
 
 func (r *PostgresUserRepository) scanUser(ctx context.Context, query string, arg any) (*user.User, error) {
 	result := &user.User{}
+	var name, job sql.NullString
+	var deptID sql.NullInt64
 	if err := r.db.QueryRowContext(ctx, query, arg).Scan(
 		&result.ID,
 		&result.Username,
 		&result.PasswordHash,
 		&result.Status,
+		&name,
+		&deptID,
+		&job,
 	); err != nil {
 		return nil, err
+	}
+	// 可空字段仅在实际有值时设置指针，保证响应输出 null 而不是空字符串。
+	if name.Valid {
+		result.Name = &name.String
+	}
+	if deptID.Valid {
+		result.DepartmentID = &deptID.Int64
+	}
+	if job.Valid {
+		result.Job = &job.String
 	}
 	return result, nil
 }

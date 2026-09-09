@@ -29,7 +29,8 @@ func RequireAccessToken(service *userservice.Service) gin.HandlerFunc {
 
 		if claims == nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": userservice.ErrInvalidToken.Error(),
+				"code":    "AUTH_INVALID_TOKEN",
+				"message": "访问令牌无效或已过期",
 			})
 			return
 		}
@@ -41,7 +42,8 @@ func RequireAccessToken(service *userservice.Service) gin.HandlerFunc {
 		)
 		if err != nil || revoked {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": userservice.ErrInvalidToken.Error(),
+				"code":    "AUTH_INVALID_TOKEN",
+				"message": "访问令牌无效或已过期",
 			})
 			return
 		}
