@@ -39,6 +39,8 @@ func newContractTestRouter(t *testing.T) *gin.Engine {
 		nil, // userRepository
 		nil, // tokenRepository
 		nil, // doctorRepository
+		nil, // scheduleRepository
+		nil, // idempotencyStore
 	)
 }
 
@@ -53,6 +55,8 @@ func newContractTestRouterWithAccessToken(t *testing.T) (*gin.Engine, string) {
 		nil, // userRepository
 		contractTokenRepo{},
 		nil, // doctorRepository
+		nil, // scheduleRepository
+		nil, // idempotencyStore
 	)
 
 	claims := &userservice.AccessClaims{
@@ -106,6 +110,11 @@ func TestRouterExposesContractRoutes(t *testing.T) {
 		"GET /api/v1/catalog/doctors/options",
 		"GET /api/v1/catalog/doctors/:doctorId",
 		"GET /api/v1/catalog/doctor-prices",
+		// 排班时段接口（规范 5.5 节）
+		"GET /api/v1/schedule/plans/:planId/slots",
+		"POST /api/v1/schedule/plans/:planId/slots",
+		"PATCH /api/v1/schedule/slots/:slotId",
+		"DELETE /api/v1/schedule/slots/:slotId",
 	}
 
 	for _, want := range required {
