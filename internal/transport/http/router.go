@@ -12,6 +12,7 @@ import (
 	"Medical-Web-Backend/internal/transport/http/handler"
 	"Medical-Web-Backend/internal/transport/http/middleware"
 	userservice "Medical-Web-Backend/internal/usecase/misuser"
+	scheduleservice "Medical-Web-Backend/internal/usecase/schedule"
 	"Medical-Web-Backend/internal/utils"
 )
 
@@ -21,6 +22,8 @@ func NewRouter(
 	userRepository port.UserRepository,
 	tokenRepository port.TokenRepository,
 	doctorRepository *repo.PostgresDoctorRepository,
+	scheduleRepository port.PlanRepository,
+	idempotencyStore port.IdempotencyStore,
 ) *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
@@ -67,6 +70,9 @@ func NewRouter(
 
 	catalogHandler := handler.NewCatalogHandler(doctorRepository, userRepository, utils.MinioPublicURL(cfg))
 
+	scheduleService := scheduleservice.NewService(scheduleRepository, nil)
+	scheduleHandler := handler.NewScheduleHandler(scheduleService, idempotencyStore)
+
 	router.Use(middleware.RequireAccessToken(service))
 
 	catalogRoutes := router.Group("/api/v1/catalog")
@@ -79,6 +85,17 @@ func NewRouter(
 	catalogRoutes.GET("/doctors/options", catalogHandler.DoctorOptions)
 	catalogRoutes.GET("/doctors/:doctorId", catalogHandler.DoctorDetail)
 	catalogRoutes.GET("/doctor-prices", catalogHandler.DoctorPrices)
+
+	// 排班计划：查询走 SCHEDULE:SELECT，写操作走 SCHEDULE:WRITE（均允许 ROOT）。
+	scheduleSelectRoutes := router.Group("/api/v1/schedule")
+	scheduleSelectRoutes.Use(middleware.RequirePermissions(userRepository, []string{"ROOT", "SCHEDULE:SELECT"}))
+	scheduleSelectRoutes.GET("/plans", scheduleHandler.ListPlans)
+
+	scheduleWriteRoutes := router.Group("/api/v1/schedule")
+	scheduleWriteRoutes.Use(middleware.RequirePermissions(userRepository, []string{"ROOT", "SCHEDULE:WRITE"}))
+	scheduleWriteRoutes.POST("/plans", scheduleHandler.CreatePlan)
+	scheduleWriteRoutes.PATCH("/plans/:planId", scheduleHandler.UpdatePlan)
+	scheduleWriteRoutes.DELETE("/plans/:planId", scheduleHandler.DeletePlan)
 
 	return router
 }

@@ -39,6 +39,8 @@ func newContractTestRouter(t *testing.T) *gin.Engine {
 		nil, // userRepository
 		nil, // tokenRepository
 		nil, // doctorRepository
+		nil, // scheduleRepository
+		nil, // idempotencyStore
 	)
 }
 
@@ -53,6 +55,8 @@ func newContractTestRouterWithAccessToken(t *testing.T) (*gin.Engine, string) {
 		nil, // userRepository
 		contractTokenRepo{},
 		nil, // doctorRepository
+		nil, // scheduleRepository
+		nil, // idempotencyStore
 	)
 
 	claims := &userservice.AccessClaims{
@@ -106,6 +110,11 @@ func TestRouterExposesContractRoutes(t *testing.T) {
 		"GET /api/v1/catalog/doctors/options",
 		"GET /api/v1/catalog/doctors/:doctorId",
 		"GET /api/v1/catalog/doctor-prices",
+		// 排班计划接口（规范第 5 章）
+		"GET /api/v1/schedule/plans",
+		"POST /api/v1/schedule/plans",
+		"PATCH /api/v1/schedule/plans/:planId",
+		"DELETE /api/v1/schedule/plans/:planId",
 	}
 
 	for _, want := range required {
@@ -205,6 +214,39 @@ func TestRouterCatalogRequiresAccessToken(t *testing.T) {
 		}
 		if body["code"] != "AUTH_INVALID_TOKEN" {
 			t.Errorf("GET %s code = %v, want AUTH_INVALID_TOKEN", path, body["code"])
+		}
+	}
+}
+
+// TestRouterScheduleRequiresAccessToken 断言排班计划路由仍受访问令牌保护：
+// 未携带令牌访问返回 401 AUTH_INVALID_TOKEN，而不是落入 handler。
+func TestRouterScheduleRequiresAccessToken(t *testing.T) {
+	router := newContractTestRouter(t)
+
+	for _, method := range []string{
+		http.MethodGet,
+		http.MethodPost,
+		http.MethodPatch,
+		http.MethodDelete,
+	} {
+		path := "/api/v1/schedule/plans"
+		if method == http.MethodPatch || method == http.MethodDelete {
+			path += "/1"
+		}
+		req := httptest.NewRequest(method, path, nil)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("%s %s status = %d, want 401; body=%s", method, path, w.Code, w.Body.String())
+			continue
+		}
+		var body map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Errorf("%s %s decode body: %v", method, path, err)
+			continue
+		}
+		if body["code"] != "AUTH_INVALID_TOKEN" {
+			t.Errorf("%s %s code = %v, want AUTH_INVALID_TOKEN", method, path, body["code"])
 		}
 	}
 }
