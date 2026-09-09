@@ -3,6 +3,8 @@ package repo
 import (
 	"context"
 	"database/sql"
+	"strconv"
+	"strings"
 
 	"Medical-Web-Backend/internal/domain/catalog"
 )
@@ -14,7 +16,8 @@ func (r *PostgresDoctorRepository) FindDoctor(ctx context.Context, id int64) (*c
 	const query = `SELECT id,name,sex,photo,birthday,school,degree,job,remark,description,hiredate,tag,recommended,status,create_time FROM hospital.doctor WHERE id=$1`
 	var d catalog.DoctorCatalog
 	var name, sex sql.NullString
-	var photo, birthday, school, degree, job, remark, description, hiredate, tag sql.NullString
+	var photo, school, degree, job, remark, description, tag sql.NullString
+	var birthday, hiredate sql.NullTime
 	var recommended sql.NullBool
 	var status sql.NullInt16
 	var createTime sql.NullTime
@@ -22,8 +25,8 @@ func (r *PostgresDoctorRepository) FindDoctor(ctx context.Context, id int64) (*c
 		return nil, err
 	}
 	d.Name, d.Sex, d.PhotoURL = name.String, sex.String, photo.String
-	d.Birthday, d.School, d.Degree, d.Job = birthday.String, school.String, degree.String, job.String
-	d.Remark, d.Description, d.HireDate = remark.String, description.String, hiredate.String
+	d.Birthday, d.School, d.Degree, d.Job = catalogDate(birthday), school.String, degree.String, job.String
+	d.Remark, d.Description, d.HireDate = remark.String, description.String, catalogDate(hiredate)
 	d.Tags = catalog.ParseTags(tag.String)
 	d.Recommended = recommended.Valid && recommended.Bool
 	d.Status = doctorStatus(status)
@@ -119,7 +122,7 @@ func (r *PostgresDoctorRepository) ListDoctorPrices(ctx context.Context, doctorI
 		if err := rows.Scan(&x.ID, &x.DoctorID, &level, &p1, &p2); err != nil {
 			return nil, 0, err
 		}
-		x.Level, x.Price1, x.Price2 = level.String, p1.String, p2.String
+		x.Level, x.Price1, x.Price2 = level.String, formatDoctorPrice(p1.String), formatDoctorPrice(p2.String)
 		items = append(items, x)
 	}
 	return items, total, rows.Err()
@@ -147,4 +150,16 @@ func catalogDate(value sql.NullTime) string {
 		return ""
 	}
 	return value.Time.Format("2006-01-02")
+}
+
+func formatDoctorPrice(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return raw
+	}
+	return strconv.FormatFloat(value, 'f', 2, 64)
 }

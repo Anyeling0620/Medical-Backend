@@ -29,12 +29,16 @@ func (h *CatalogHandler) DoctorDetail(c *gin.Context) {
 		return
 	}
 	item, err := h.repository.FindDoctor(c.Request.Context(), id)
-	if errors.Is(err, sql.ErrNoRows) || item == nil {
-		c.JSON(404, gin.H{"code": "CATALOG_DOCTOR_NOT_FOUND", "message": "医生不存在"})
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(404, gin.H{"code": "CATALOG_DOCTOR_NOT_FOUND", "message": "医生不存在"})
+			return
+		}
+		h.internal(c)
 		return
 	}
-	if err != nil {
-		h.internal(c)
+	if item == nil {
+		c.JSON(404, gin.H{"code": "CATALOG_DOCTOR_NOT_FOUND", "message": "医生不存在"})
 		return
 	}
 	if item.Status == "HIDDEN" && !h.isRoot(c) {
