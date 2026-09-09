@@ -81,6 +81,51 @@ func (h *CatalogHandler) DoctorPrices(c *gin.Context) {
 	}
 	c.JSON(200, catalog.Page[catalog.DoctorPrice]{Items: items, Page: *r.Page, PageSize: *r.PageSize, Total: total})
 }
+
+func (h *CatalogHandler) SubdepartmentDetail(c *gin.Context) {
+	id, err := request.ParsePositiveID(c.Param("subdepartmentId"))
+	if err != nil {
+		h.validation(c, errors.New("子科室编号必须为正整数"))
+		return
+	}
+	item, err := h.repository.FindSubdepartment(c.Request.Context(), id)
+	if errors.Is(err, sql.ErrNoRows) || item == nil {
+		c.JSON(404, gin.H{"code": "CATALOG_SUBDEPARTMENT_NOT_FOUND", "message": "子科室不存在"})
+		return
+	}
+	if err != nil {
+		h.internal(c)
+		return
+	}
+	c.JSON(200, item)
+}
+
+func (h *CatalogHandler) Doctors(c *gin.Context) {
+	r, err := request.BindCatalogDoctors(c)
+	if err != nil {
+		h.validation(c, err)
+		return
+	}
+	items, total, err := h.repository.ListDoctors(c.Request.Context(), catalog.DoctorFilter{
+		DepartmentID:    r.DepartmentID,
+		SubdepartmentID: r.SubdepartmentID,
+		Name:            r.Name,
+		Job:             r.Job,
+		Degree:          r.Degree,
+		Recommended:     r.Recommended,
+		Status:          r.Status,
+		Sort:            r.Sort,
+		Order:           r.Order,
+	}, (r.Page-1)*r.PageSize, r.PageSize)
+	if err != nil {
+		h.internal(c)
+		return
+	}
+	for i := range items {
+		items[i].PhotoURL = h.photoURL(items[i].PhotoURL)
+	}
+	c.JSON(200, catalog.Page[catalog.DoctorCatalog]{Items: items, Page: r.Page, PageSize: r.PageSize, Total: total})
+}
 func (h *CatalogHandler) ListDepartments(c *gin.Context) {
 	r, err := request.BindDepartmentList(c)
 	if err != nil || r.Validate() != nil {

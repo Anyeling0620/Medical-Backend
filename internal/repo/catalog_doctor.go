@@ -3,6 +3,7 @@ package repo
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -162,4 +163,114 @@ func formatDoctorPrice(raw string) string {
 		return raw
 	}
 	return strconv.FormatFloat(value, 'f', 2, 64)
+}
+
+func (r *PostgresDoctorRepository) ListDoctors(ctx context.Context, f catalog.DoctorFilter, offset, limit int) ([]catalog.DoctorCatalog, int64, error) {
+	if r == nil || r.db == nil {
+		return nil, 0, sql.ErrConnDone
+	}
+	where, args := doctorCatalogWhere(f)
+	var total int64
+	if err := r.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM hospital.doctor d"+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	column := "d.id"
+	switch f.Sort {
+	case "name":
+		column = "d.name"
+	case "hireDate":
+		column = "d.hiredate"
+	case "recommended":
+		column = "d.recommended"
+	}
+	direction := "ASC"
+	if f.Order == "desc" {
+		direction = "DESC"
+	}
+	args = append(args, limit, offset)
+	query := `SELECT d.id,d.name,d.sex,d.photo,d.birthday,d.school,d.degree,d.job,d.remark,d.description,d.hiredate,d.tag,d.recommended,d.status,d.create_time FROM hospital.doctor d` + where +
+		fmt.Sprintf(` ORDER BY %s %s, d.id ASC LIMIT $%d OFFSET $%d`, column, direction, len(args)-1, len(args))
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	items := make([]catalog.DoctorCatalog, 0)
+	for rows.Next() {
+		item, err := scanDoctorCatalog(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		items = append(items, item)
+	}
+	return items, total, rows.Err()
+}
+
+func doctorCatalogWhere(f catalog.DoctorFilter) (string, []any) {
+	conditions := make([]string, 0, 8)
+	args := make([]any, 0, 8)
+	conditions = append(conditions, `EXISTS (SELECT 1 FROM hospital.medical_dept_sub_and_doctor sd WHERE sd.doctor_id = d.id)`)
+	if f.DepartmentID != nil {
+		args = append(args, *f.DepartmentID)
+		conditions = append(conditions, fmt.Sprintf(`EXISTS (SELECT 1 FROM hospital.medical_dept_sub_and_doctor sd JOIN hospital.medical_dept_sub ds ON ds.id = sd.dept_sub_id WHERE sd.doctor_id = d.id AND ds.dept_id = $%d)`, len(args)))
+	}
+	if f.SubdepartmentID != nil {
+		args = append(args, *f.SubdepartmentID)
+		conditions = append(conditions, fmt.Sprintf(`EXISTS (SELECT 1 FROM hospital.medical_dept_sub_and_doctor sd WHERE sd.doctor_id = d.id AND sd.dept_sub_id = $%d)`, len(args)))
+	}
+	if f.Name != nil {
+		args = append(args, "%"+*f.Name+"%")
+		conditions = append(conditions, fmt.Sprintf(`d.name ILIKE $%d`, len(args)))
+	}
+	if f.Job != nil {
+		args = append(args, *f.Job)
+		conditions = append(conditions, fmt.Sprintf(`d.job = $%d`, len(args)))
+	}
+	if f.Degree != nil {
+		args = append(args, *f.Degree)
+		conditions = append(conditions, fmt.Sprintf(`d.degree = $%d`, len(args)))
+	}
+	if f.Recommended != nil {
+		args = append(args, *f.Recommended)
+		conditions = append(conditions, fmt.Sprintf(`d.recommended = $%d`, len(args)))
+	}
+	if f.Status != "" {
+		args = append(args, doctorStatusCode(f.Status))
+		conditions = append(conditions, fmt.Sprintf(`d.status = $%d`, len(args)))
+	}
+	return " WHERE " + strings.Join(conditions, " AND "), args
+}
+
+func scanDoctorCatalog(scanner interface{ Scan(dest ...any) error }) (catalog.DoctorCatalog, error) {
+	var item catalog.DoctorCatalog
+	var name, sex, photo, school, degree, job, remark, description, tag sql.NullString
+	var birthday, hiredate, createTime sql.NullTime
+	var recommended sql.NullBool
+	var status sql.NullInt16
+	err := scanner.Scan(&item.ID, &name, &sex, &photo, &birthday, &school, &degree, &job, &remark, &description, &hiredate, &tag, &recommended, &status, &createTime)
+	if err != nil {
+		return catalog.DoctorCatalog{}, err
+	}
+	item.Name, item.Sex, item.PhotoURL = name.String, sex.String, photo.String
+	item.Birthday, item.School, item.Degree, item.Job = catalogDate(birthday), school.String, degree.String, job.String
+	item.Remark, item.Description, item.HireDate = remark.String, description.String, catalogDate(hiredate)
+	item.Tags = catalog.ParseTags(tag.String)
+	item.Recommended = recommended.Valid && recommended.Bool
+	item.Status = doctorStatus(status)
+	item.CreateDate = catalogDate(createTime)
+	return item, nil
+}
+
+func doctorStatusCode(status string) int16 {
+	switch status {
+	case catalog.DoctorStatusActive:
+		return 1
+	case catalog.DoctorStatusResigned:
+		return 2
+	case catalog.DoctorStatusRetired:
+		return 3
+	case catalog.DoctorStatusHidden:
+		return 4
+	}
+	return 0
 }

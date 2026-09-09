@@ -119,6 +119,22 @@ func (r *PostgresDoctorRepository) ListSubdepartments(ctx context.Context, depar
 	return items, total, rows.Err()
 }
 
+func (r *PostgresDoctorRepository) FindSubdepartment(ctx context.Context, id int64) (*catalog.SubdepartmentDetail, error) {
+	if r == nil || r.db == nil {
+		return nil, sql.ErrConnDone
+	}
+	var item catalog.SubdepartmentDetail
+	var name, location, deptName sql.NullString
+	err := r.db.QueryRowContext(ctx, `SELECT s.id,s.name,s.dept_id,s.location,p.id,p.name FROM hospital.medical_dept_sub s JOIN hospital.medical_dept p ON p.id=s.dept_id WHERE s.id=$1`, id).Scan(&item.ID, &name, &item.DepartmentID, &location, &item.Department.ID, &deptName)
+	if err != nil {
+		return nil, err
+	}
+	item.Name = name.String
+	item.Location = location.String
+	item.Department.Name = deptName.String
+	return &item, nil
+}
+
 func NewPostgresDoctorRepository(db *sql.DB) *PostgresDoctorRepository {
 	return &PostgresDoctorRepository{db: db}
 }

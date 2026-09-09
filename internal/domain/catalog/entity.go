@@ -34,6 +34,29 @@ type DepartmentFilter struct {
 	Order       string
 }
 
+// DoctorFilter contains the optional filters and ordering for the doctor catalog
+// list endpoint. Status uses the canonical ACTIVE/RESIGNED/RETIRED/HIDDEN value.
+type DoctorFilter struct {
+	DepartmentID    *int64
+	SubdepartmentID *int64
+	Name            *string
+	Job             *string
+	Degree          *string
+	Recommended     *bool
+	Status          string
+	Sort            string
+	Order           string
+}
+
+// Doctor status values reported by the catalog API. doctor.status stores them
+// as 1=ACTIVE, 2=RESIGNED, 3=RETIRED and 4=HIDDEN.
+const (
+	DoctorStatusActive   = "ACTIVE"
+	DoctorStatusResigned = "RESIGNED"
+	DoctorStatusRetired  = "RETIRED"
+	DoctorStatusHidden   = "HIDDEN"
+)
+
 type Page[T any] struct {
 	Items    []T   `json:"items"`
 	Page     int   `json:"page"`
