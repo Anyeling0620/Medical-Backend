@@ -62,6 +62,7 @@ func NewRouter(
 	router.POST("/refresh", authHandler.Refresh)
 
 	doctorHandler := handler.NewDoctorHandler(doctorRepository, utils.MinioPublicURL(cfg))
+	catalogHandler := handler.NewCatalogHandler(doctorRepository)
 
 	router.GET("/depts", doctorHandler.ListDepts)
 	router.GET("/degrees", doctorHandler.ListDegrees)
@@ -72,6 +73,11 @@ func NewRouter(
 	router.GET("/logout", authHandler.Logout)
 	router.GET("/doctor/search", doctorHandler.Search)
 	router.GET("/doctor/searchCount", doctorHandler.SearchCount)
+	catalogRoutes := router.Group("/api/v1/catalog")
+	catalogRoutes.Use(middleware.RequirePermissions(userRepository, []string{"ROOT", "CATALOG:SELECT"}))
+	catalogRoutes.GET("/departments", catalogHandler.ListDepartments)
+	catalogRoutes.GET("/departments/:departmentId", catalogHandler.Detail)
+	catalogRoutes.GET("/departments/:departmentId/subdepartments", catalogHandler.Subdepartments)
 
 	router.GET(
 		"/doctor/:id",
