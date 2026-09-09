@@ -3,16 +3,23 @@ package handler
 import (
 	"Medical-Web-Backend/internal/domain/catalog"
 	"Medical-Web-Backend/internal/port"
+	"Medical-Web-Backend/internal/transport/http/middleware"
 	"Medical-Web-Backend/internal/transport/http/request"
+	misuser "Medical-Web-Backend/internal/usecase/misuser"
 	"database/sql"
 	"errors"
 	"github.com/gin-gonic/gin"
+	"strings"
 )
 
-type CatalogHandler struct{ repository port.CatalogRepository }
+type CatalogHandler struct {
+	repository port.CatalogRepository
+	users      port.UserRepository
+	minioURL   string
+}
 
-func NewCatalogHandler(r port.CatalogRepository) *CatalogHandler {
-	return &CatalogHandler{repository: r}
+func NewCatalogHandler(r port.CatalogRepository, users port.UserRepository, minioURL string) *CatalogHandler {
+	return &CatalogHandler{repository: r, users: users, minioURL: strings.TrimRight(minioURL, "/")}
 }
 
 func (h *CatalogHandler) DoctorDetail(c *gin.Context) {
@@ -30,6 +37,11 @@ func (h *CatalogHandler) DoctorDetail(c *gin.Context) {
 		h.internal(c)
 		return
 	}
+	if item.Status == "HIDDEN" && !h.isRoot(c) {
+		c.JSON(404, gin.H{"code": "CATALOG_DOCTOR_NOT_FOUND", "message": "医生不存在"})
+		return
+	}
+	item.PhotoURL = h.photoURL(item.PhotoURL)
 	c.JSON(200, item)
 }
 
@@ -129,4 +141,29 @@ func (h *CatalogHandler) notFound(c *gin.Context) {
 }
 func (h *CatalogHandler) internal(c *gin.Context) {
 	c.JSON(500, gin.H{"code": "INTERNAL_SERVER_ERROR", "message": "查询失败"})
+}
+
+func (h *CatalogHandler) photoURL(photo string) string {
+	if photo == "" || h.minioURL == "" {
+		return photo
+	}
+	return h.minioURL + "/" + strings.TrimLeft(photo, "/")
+}
+
+func (h *CatalogHandler) isRoot(c *gin.Context) bool {
+	value, exists := c.Get(middleware.ClaimsKey)
+	claims, ok := value.(*misuser.AccessClaims)
+	if !exists || !ok || claims == nil || h.users == nil {
+		return false
+	}
+	permissions, err := h.users.Permissions(c.Request.Context(), claims.UserID)
+	if err != nil {
+		return false
+	}
+	for _, permission := range permissions {
+		if permission == "ROOT" {
+			return true
+		}
+	}
+	return false
 }

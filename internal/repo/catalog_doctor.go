@@ -13,14 +13,15 @@ func (r *PostgresDoctorRepository) FindDoctor(ctx context.Context, id int64) (*c
 	}
 	const query = `SELECT id,name,sex,photo,birthday,school,degree,job,remark,description,hiredate,tag,recommended,status,create_time FROM hospital.doctor WHERE id=$1`
 	var d catalog.DoctorCatalog
+	var name, sex sql.NullString
 	var photo, birthday, school, degree, job, remark, description, hiredate, tag sql.NullString
 	var recommended sql.NullBool
 	var status sql.NullInt16
 	var createTime sql.NullTime
-	if err := r.db.QueryRowContext(ctx, query, id).Scan(&d.ID, &d.Name, &d.Sex, &photo, &birthday, &school, &degree, &job, &remark, &description, &hiredate, &tag, &recommended, &status, &createTime); err != nil {
+	if err := r.db.QueryRowContext(ctx, query, id).Scan(&d.ID, &name, &sex, &photo, &birthday, &school, &degree, &job, &remark, &description, &hiredate, &tag, &recommended, &status, &createTime); err != nil {
 		return nil, err
 	}
-	d.PhotoURL = photo.String
+	d.Name, d.Sex, d.PhotoURL = name.String, sex.String, photo.String
 	d.Birthday, d.School, d.Degree, d.Job = birthday.String, school.String, degree.String, job.String
 	d.Remark, d.Description, d.HireDate = remark.String, description.String, hiredate.String
 	d.Tags = catalog.ParseTags(tag.String)

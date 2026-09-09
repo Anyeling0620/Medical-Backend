@@ -62,7 +62,7 @@ func NewRouter(
 	router.POST("/refresh", authHandler.Refresh)
 
 	doctorHandler := handler.NewDoctorHandler(doctorRepository, utils.MinioPublicURL(cfg))
-	catalogHandler := handler.NewCatalogHandler(doctorRepository)
+	catalogHandler := handler.NewCatalogHandler(doctorRepository, userRepository, utils.MinioPublicURL(cfg))
 
 	router.GET("/depts", doctorHandler.ListDepts)
 	router.GET("/degrees", doctorHandler.ListDegrees)
