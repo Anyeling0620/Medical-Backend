@@ -211,6 +211,8 @@ func (s *Service) Refresh(
 		return authsession.TokenPair{}, dependencyError(err)
 	}
 	if !profile.IsActive() {
+		// 账号已被禁用：旧 refresh 会话已随上面的轮换被撤销，且不再写入新会话，
+		// 因此禁用账号会立即失去续期能力（403 AUTH_FORBIDDEN 在 refresh 上同样成立）。
 		return authsession.TokenPair{}, ErrPatientDisabled
 	}
 

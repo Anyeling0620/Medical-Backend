@@ -37,7 +37,8 @@ func NewPatientAuthHandler(
 }
 
 // WeChatLogin 处理 POST /api/v1/patient/auth/wechat-login：登录与注册合一。
-// 成功响应用 isNewUser 区分本次是否为新注册，refresh token 只经 HttpOnly Cookie 返回。
+// 成功响应用 isNewUser 区分本次是否为新注册；refresh token 同时经 HttpOnly Cookie
+// （浏览器通道）与响应体（小程序通道，wx.request 不携带 Cookie）下发。
 func (h *PatientAuthHandler) WeChatLogin(c *gin.Context) {
 	var req request.WeChatLoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -72,18 +73,22 @@ func (h *PatientAuthHandler) WeChatLogin(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, response.PatientLoginResponse{
-		IsNewUser:       result.IsNewUser,
-		Patient:         response.NewPatientSummary(result.Patient),
-		CardID:          cardID,
-		AccessToken:     result.Tokens.AccessToken,
-		AccessExpiresAt: result.Tokens.AccessExpiresAt.UTC().Format(time.RFC3339),
+		IsNewUser:        result.IsNewUser,
+		Patient:          response.NewPatientSummary(result.Patient),
+		CardID:           cardID,
+		AccessToken:      result.Tokens.AccessToken,
+		AccessExpiresAt:  result.Tokens.AccessExpiresAt.UTC().Format(time.RFC3339),
+		RefreshToken:     result.Tokens.RefreshToken,
+		RefreshExpiresAt: result.Tokens.RefreshExpiresAt.UTC().Format(time.RFC3339),
 	})
 }
 
 // Refresh 处理 POST /api/v1/patient/auth/refresh。
 //
-// refresh token 优先取请求体、其次取 Cookie（契约 §7.2 允许两种来源）：
-// 小程序把令牌保存在本地存储，不能依赖 Cookie 通道。
+// refresh token 允许两条通道携带（契约 §7.2）：请求体（小程序，无法使用 Cookie）
+// 与 Cookie（浏览器）。请求体优先；请求体令牌无效时继续尝试 Cookie，
+// 两条通道都拿不出有效令牌才返回 401，避免「携带过期请求体令牌但持有有效 Cookie」
+// 的浏览器被误判成未认证。
 func (h *PatientAuthHandler) Refresh(c *gin.Context) {
 	var req request.PatientRefreshRequest
 	// 请求体是可选的：只有「空请求体」按缺省处理（继续走 Cookie 通道），
@@ -96,41 +101,81 @@ func (h *PatientAuthHandler) Refresh(c *gin.Context) {
 		req.RefreshToken = ""
 	}
 
-	refreshToken := req.RefreshToken
-	if refreshToken == "" {
-		refreshToken, _ = c.Cookie(authsession.RefreshCookieName)
-	}
-
-	pair, err := h.service.Refresh(c.Request.Context(), refreshToken)
-	if err != nil {
-		switch {
-		case errors.Is(err, patientauthservice.ErrPatientDisabled):
-			h.writeError(c, http.StatusForbidden, "AUTH_FORBIDDEN", "账号已被禁用")
-		case errors.Is(err, patientauthservice.ErrDependencyUnavailable):
-			h.writeError(
-				c,
-				http.StatusBadGateway,
-				"DEPENDENCY_UNAVAILABLE",
-				"服务暂时不可用，请稍后重试",
-			)
-		default:
-			h.writeError(
-				c,
-				http.StatusUnauthorized,
-				"AUTH_INVALID_REFRESH_TOKEN",
-				"刷新令牌无效或已过期",
-			)
-		}
+	candidates := refreshTokenCandidates(req.RefreshToken, c)
+	if len(candidates) == 0 {
+		// 未携带凭据与凭据无效返回同一分支：不泄露令牌是否存在。
+		h.refreshError(c, patientauthservice.ErrInvalidRefreshToken)
 		return
 	}
 
-	// 轮换后的 refresh token 覆盖 Cookie，access token 同时下发到 Cookie 与响应体。
+	var (
+		pair authsession.TokenPair
+		err  error
+	)
+	for _, candidate := range candidates {
+		pair, err = h.service.Refresh(c.Request.Context(), candidate)
+		// 只有「令牌无效」才继续尝试下一条通道；轮换成功或账号禁用、依赖故障
+		// 都必须立即结束循环，后者不能被另一条通道的结果掩盖（契约 §7.2、§10）。
+		if err == nil || !errors.Is(err, patientauthservice.ErrInvalidRefreshToken) {
+			break
+		}
+	}
+	if err != nil {
+		h.refreshError(c, err)
+		return
+	}
+
+	// 轮换后的 refresh token 同时覆盖 Cookie 与响应体：浏览器沿用 Cookie 通道，
+	// 小程序从响应体读取新令牌并本地保存（契约 §7.2）。
 	setTokenCookies(c, pair, h.secure)
 
 	c.JSON(http.StatusOK, response.PatientRefreshResponse{
-		AccessToken:     pair.AccessToken,
-		AccessExpiresAt: pair.AccessExpiresAt.UTC().Format(time.RFC3339),
+		AccessToken:      pair.AccessToken,
+		AccessExpiresAt:  pair.AccessExpiresAt.UTC().Format(time.RFC3339),
+		RefreshToken:     pair.RefreshToken,
+		RefreshExpiresAt: pair.RefreshExpiresAt.UTC().Format(time.RFC3339),
 	})
+}
+
+// refreshTokenCandidates 收集请求中可能携带的 refresh token（契约 §7.2 允许两种来源）：
+// 请求体优先（小程序没有 Cookie 通道），Cookie 作为备用来源（浏览器）。
+// 空白值按未携带处理，避免把空串当成凭据去校验。
+func refreshTokenCandidates(bodyToken string, c *gin.Context) []string {
+	candidates := make([]string, 0, 2)
+
+	if token := strings.TrimSpace(bodyToken); token != "" {
+		candidates = append(candidates, token)
+	}
+
+	if token, err := c.Cookie(authsession.RefreshCookieName); err == nil {
+		if token = strings.TrimSpace(token); token != "" {
+			candidates = append(candidates, token)
+		}
+	}
+
+	return candidates
+}
+
+// refreshError 把刷新失败映射为契约错误码（spec/04-api-contract.md §7.2、§10）。
+func (h *PatientAuthHandler) refreshError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, patientauthservice.ErrPatientDisabled):
+		h.writeError(c, http.StatusForbidden, "AUTH_FORBIDDEN", "账号已被禁用")
+	case errors.Is(err, patientauthservice.ErrDependencyUnavailable):
+		h.writeError(
+			c,
+			http.StatusBadGateway,
+			"DEPENDENCY_UNAVAILABLE",
+			"服务暂时不可用，请稍后重试",
+		)
+	default:
+		h.writeError(
+			c,
+			http.StatusUnauthorized,
+			"AUTH_INVALID_REFRESH_TOKEN",
+			"刷新令牌无效或已过期",
+		)
+	}
 }
 
 // Logout 处理 POST /api/v1/patient/auth/logout，成功固定返回 204。
@@ -150,9 +195,12 @@ func (h *PatientAuthHandler) Logout(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		req.RefreshToken = ""
 	}
-	refreshToken := req.RefreshToken
-	if refreshToken == "" {
-		refreshToken, _ = c.Cookie(authsession.RefreshCookieName)
+	// refresh token 只用于确定撤销范围，取首个可用通道（请求体优先、Cookie 备用）；
+	// access token 的 sid 兜底撤销不依赖它，因此缺省或失配都不影响登出幂等。
+	candidates := refreshTokenCandidates(req.RefreshToken, c)
+	refreshToken := ""
+	if len(candidates) > 0 {
+		refreshToken = candidates[0]
 	}
 
 	if err := h.service.Logout(

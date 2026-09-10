@@ -4,13 +4,22 @@ import "Medical-Web-Backend/internal/domain/patient"
 
 // PatientLoginResponse 是 POST /api/v1/patient/auth/wechat-login 的成功响应
 // （spec/04-api-contract.md §7.1 与 §12.5）。
-// refresh token 只通过 HttpOnly Cookie 返回，绝不进入响应体。
+//
+// refresh token 同时经两条通道下发：HttpOnly Cookie（浏览器）与响应体
+// （微信小程序：wx.request 不携带 Cookie）。响应体字段只服务于小程序通道，
+// 浏览器端应忽略它并继续使用 Cookie。
 type PatientLoginResponse struct {
 	IsNewUser       bool           `json:"isNewUser"`
 	Patient         PatientSummary `json:"patient"`
 	CardID          *int64         `json:"cardId"`
 	AccessToken     string         `json:"accessToken"`
 	AccessExpiresAt string         `json:"accessExpiresAt"`
+	// RefreshToken 是本次登录的 refresh 令牌原文，供小程序本地保存并续期；
+	// 必须存放在 App 沙箱存储，不得写入浏览器可读的 localStorage（契约 §1.2）。
+	RefreshToken string `json:"refreshToken"`
+	// RefreshExpiresAt 是该 refresh 会话的过期时刻（RFC3339），
+	// 供客户端在过期前主动重新登录，避免一次注定失败的刷新。
+	RefreshExpiresAt string `json:"refreshExpiresAt"`
 }
 
 // PatientSummary 是 patient_user 的对外投影：openId 仅服务端保存，
@@ -39,11 +48,15 @@ func NewPatientSummary(profile *patient.Patient) PatientSummary {
 	}
 }
 
-// PatientRefreshResponse 是 POST /api/v1/patient/auth/refresh 的成功响应：
-// 只返回新的 access token，轮换后的 refresh token 仍通过 HttpOnly Cookie 下发。
+// PatientRefreshResponse 是 POST /api/v1/patient/auth/refresh 的成功响应。
+//
+// 轮换后的 refresh token 同时经 HttpOnly Cookie（浏览器）与响应体（小程序）下发：
+// 小程序读不到 Cookie，若响应体不回传新令牌，第一次刷新后便无凭据可继续续期。
 type PatientRefreshResponse struct {
-	AccessToken     string `json:"accessToken"`
-	AccessExpiresAt string `json:"accessExpiresAt"`
+	AccessToken      string `json:"accessToken"`
+	AccessExpiresAt  string `json:"accessExpiresAt"`
+	RefreshToken     string `json:"refreshToken"`
+	RefreshExpiresAt string `json:"refreshExpiresAt"`
 }
 
 // PatientMeResponse 是 GET /api/v1/patient/me 的成功响应（spec/04-api-contract.md §7.3）。
