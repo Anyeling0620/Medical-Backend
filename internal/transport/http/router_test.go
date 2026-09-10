@@ -29,6 +29,15 @@ func (contractTokenRepo) IsAccessTokenRevoked(_ context.Context, _ string) (bool
 	return false, nil
 }
 
+// DeleteRefreshSessionBySessionID 让契约测试桩满足 TokenRepository 的全部方法：
+// 本桩不保存会话，因此按契约返回 (false, nil)，避免内嵌 nil 接口时调用即 panic。
+func (contractTokenRepo) DeleteRefreshSessionBySessionID(
+	_ context.Context,
+	_ string,
+) (bool, error) {
+	return false, nil
+}
+
 // newContractTestRouter 以 nil 仓库与零值配置构造完整路由树，
 // 仅用于契约断言（不发起真实数据库/Redis 请求）。
 func newContractTestRouter(t *testing.T) *gin.Engine {
@@ -42,6 +51,8 @@ func newContractTestRouter(t *testing.T) *gin.Engine {
 		nil, // doctorRepository
 		nil, // scheduleRepository
 		nil, // idempotencyStore
+		nil, // patientRepository
+		nil, // wechatAuthenticator
 	)
 }
 
@@ -58,6 +69,8 @@ func newContractTestRouterWithAccessToken(t *testing.T) (*gin.Engine, string) {
 		nil, // doctorRepository
 		nil, // scheduleRepository
 		nil, // idempotencyStore
+		nil, // patientRepository
+		nil, // wechatAuthenticator
 	)
 
 	claims := &userservice.AccessClaims{
@@ -122,6 +135,11 @@ func TestRouterExposesContractRoutes(t *testing.T) {
 		"POST /api/v1/schedule/plans/:planId/slots",
 		"PATCH /api/v1/schedule/slots/:slotId",
 		"DELETE /api/v1/schedule/slots/:slotId",
+		// 患者端认证与当前患者（规范第 7 章）
+		"POST /api/v1/patient/auth/wechat-login",
+		"POST /api/v1/patient/auth/refresh",
+		"POST /api/v1/patient/auth/logout",
+		"GET /api/v1/patient/me",
 	}
 
 	for _, want := range required {

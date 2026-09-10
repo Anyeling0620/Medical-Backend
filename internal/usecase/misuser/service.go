@@ -2,32 +2,39 @@ package misuser
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/golang-jwt/jwt/v5"
 	"strings"
 	"time"
 
 	domainauth "Medical-Web-Backend/internal/domain/auth"
 	domainuser "Medical-Web-Backend/internal/domain/user"
 	"Medical-Web-Backend/internal/port"
-	"github.com/google/uuid"
+	"Medical-Web-Backend/internal/usecase/authsession"
 )
 
 const (
-	AccessCookieName  = "medical_access_token"
-	RefreshCookieName = "medical_refresh_token"
-	TokenTypeAccess   = "access"
+	// Cookie 名与令牌类型由共用会话层统一定义：管理端与患者端必须一致，
+	// 否则同一份中间件无法对两个域都提供 Cookie 兜底通道。
+	AccessCookieName  = authsession.AccessCookieName
+	RefreshCookieName = authsession.RefreshCookieName
+	TokenTypeAccess   = authsession.TokenTypeAccess
 )
 
 var (
 	ErrInvalidCredentials = errors.New("invalid username or password")
 	ErrInvalidInput       = errors.New("username and password are required")
 	ErrInactiveUser       = errors.New("user is inactive")
-	ErrInvalidToken       = errors.New("invalid token")
+	// ErrInvalidToken 直接指向共用会话层的哨兵错误，
+	// 保证管理端与患者端对「令牌无效」的判定与处理完全一致。
+	ErrInvalidToken = authsession.ErrInvalidToken
+)
+
+// 类型别名：handler、middleware 与既有测试继续通过 userservice 引用这些类型，
+// 但实现只有共用会话层（authsession）一份。
+type (
+	AccessClaims = authsession.AccessClaims
+	TokenPair    = authsession.TokenPair
 )
 
 type Config struct {
@@ -37,32 +44,18 @@ type Config struct {
 	CookieSecure bool
 }
 
-type TokenPair struct {
-	AccessToken      string
-	RefreshToken     string
-	AccessExpiresAt  time.Time
-	RefreshExpiresAt time.Time
-}
-
 type LoginResult struct {
 	User        *domainuser.User
 	Permissions []string
 	Tokens      TokenPair
 }
 
-type AccessClaims struct {
-	UserID    int64            `json:"uid"`
-	Username  string           `json:"username"`
-	TokenType string           `json:"token_type"`
-	Realm     domainauth.Realm `json:"realm"`
-	SessionID string           `json:"sid"`
-	jwt.RegisteredClaims
-}
-
+// Service 是管理端（realm=mis）认证 use case：负责 mis_user 主体解析与权限加载，
+// 令牌签发、解析、轮换与撤销全部委托给共用会话层。
 type Service struct {
-	users  port.UserRepository
-	tokens port.TokenRepository
-	cfg    Config
+	users   port.UserRepository
+	tokens  port.TokenRepository
+	session *authsession.Manager
 }
 
 func NewService(
@@ -73,7 +66,14 @@ func NewService(
 	return &Service{
 		users:  users,
 		tokens: tokens,
-		cfg:    cfg,
+		session: authsession.NewManager(
+			tokens,
+			authsession.Config{
+				JWTSecret:  cfg.JWTSecret,
+				AccessTTL:  cfg.AccessTTL,
+				RefreshTTL: cfg.RefreshTTL,
+			},
+		),
 	}
 }
 
@@ -118,7 +118,13 @@ func (s *Service) Authenticate(
 		return nil, err
 	}
 
-	if err := s.saveRefreshSession(ctx, pair, sessionID, u, domainauth.RealmMis); err != nil {
+	if err := s.saveRefreshSession(
+		ctx,
+		pair,
+		sessionID,
+		u,
+		domainauth.RealmMis,
+	); err != nil {
 		return nil, err
 	}
 
@@ -132,8 +138,8 @@ func (s *Service) Authenticate(
 // Refresh 用 refresh 会话换取新的令牌对，会话所属域与请求域必须一致。
 //
 // 注意：当前主体解析只走管理端仓库（mis_user 与管理端权限表），因此调用方现阶段
-// 只应传 RealmMis；患者域刷新必须在扩展 patient_user 的主体解析后再开放，否则会
-// 用患者 ID 去命中同号管理用户（spec/02-architecture.md「认证与令牌边界」）。
+// 只应传 RealmMis；患者域刷新走 patientauth.Service，否则会用患者 ID 去命中同号
+// 管理用户（spec/02-architecture.md「认证与令牌边界」）。
 func (s *Service) Refresh(
 	ctx context.Context,
 	refreshToken string,
@@ -143,21 +149,10 @@ func (s *Service) Refresh(
 		return nil, ErrInvalidToken
 	}
 
-	tokenHash := hashRefreshToken(refreshToken)
-
-	session, err := s.tokens.GetRefreshSession(ctx, tokenHash)
-	if err != nil || session == nil {
-		return nil, ErrInvalidToken
-	}
-
-	// 刷新会话同样按 realm 隔离：其他认证域的 refresh token 不得在本域换取新令牌。
-	if session.Realm != realm {
-		return nil, ErrInvalidToken
-	}
-
-	// Refresh token rotation: old token is immediately invalidated.
-	if err := s.tokens.DeleteRefreshSession(ctx, tokenHash); err != nil {
-		return nil, fmt.Errorf("rotate refresh session: %w", err)
+	// 轮换：旧 refresh token 立即失效，并校验会话 realm 与请求域一致。
+	session, err := s.session.RotateRefreshSession(ctx, refreshToken, realm)
+	if err != nil {
+		return nil, err
 	}
 
 	u, err := s.users.FindByID(ctx, session.UserID)
@@ -186,175 +181,42 @@ func (s *Service) Refresh(
 	}, nil
 }
 
+// Logout 撤销当前会话，幂等；是否容忍无效 access token 由 handler 决定。
 func (s *Service) Logout(
 	ctx context.Context,
 	accessToken string,
 	refreshToken string,
 	realm domainauth.Realm,
 ) error {
-	if !realm.Valid() {
-		return ErrInvalidToken
-	}
-
-	if refreshToken != "" && s.tokens != nil {
-		if err := s.revokeRefreshSession(ctx, refreshToken, realm); err != nil {
-			return err
-		}
-	}
-
-	if accessToken == "" {
-		return nil
-	}
-
-	claims, err := s.ParseAccessToken(accessToken, realm)
-	if err != nil {
-		return ErrInvalidToken
-	}
-
-	if claims.ExpiresAt == nil {
-		return nil
-	}
-
-	remaining := time.Until(claims.ExpiresAt.Time)
-	if remaining <= 0 {
-		return nil
-	}
-
-	ttlSeconds := int64(remaining / time.Second)
-	if ttlSeconds < 1 {
-		ttlSeconds = 1
-	}
-
-	return s.tokens.RevokeAccessToken(
-		ctx,
-		claims.ID,
-		ttlSeconds+1,
-	)
-}
-
-// revokeRefreshSession 撤销属于指定认证域的 refresh 会话。
-// 会话不存在或已过期时按幂等空操作处理；会话属于其他 realm 时不解释也不撤销，
-// 避免用两个域的令牌互相破坏对方的会话；其余读取失败必须如实上报，不得静默成功。
-func (s *Service) revokeRefreshSession(
-	ctx context.Context,
-	refreshToken string,
-	realm domainauth.Realm,
-) error {
-	tokenHash := hashRefreshToken(refreshToken)
-
-	session, err := s.tokens.GetRefreshSession(ctx, tokenHash)
-	switch {
-	case errors.Is(err, port.ErrRefreshSessionNotFound),
-		err == nil && session == nil:
-		// 会话不存在、已过期或已轮换：登出保持幂等成功。
-		return nil
-	case err != nil:
-		// 读取失败（例如 Redis 不可用）不等于「没有会话」，
-		// 此时无法判断会话归属，必须上报而不是继续删除。
-		return err
-	case session.Realm != realm:
-		// 其他认证域的会话不属于本次登出范围。
-		return nil
-	}
-
-	return s.tokens.DeleteRefreshSession(ctx, tokenHash)
+	return s.session.Logout(ctx, accessToken, refreshToken, realm)
 }
 
 func (s *Service) ParseAccessToken(
 	raw string,
 	expectedRealm domainauth.Realm,
 ) (*AccessClaims, error) {
-	if raw == "" || s.cfg.JWTSecret == "" || !expectedRealm.Valid() {
-		return nil, ErrInvalidToken
-	}
-
-	claims := &AccessClaims{}
-
-	token, err := jwt.ParseWithClaims(
-		raw,
-		claims,
-		func(token *jwt.Token) (any, error) {
-			if token.Method != jwt.SigningMethodHS256 {
-				return nil, ErrInvalidToken
-			}
-			return []byte(s.cfg.JWTSecret), nil
-		},
-	)
-
-	if err != nil ||
-		!token.Valid ||
-		claims.TokenType != TokenTypeAccess ||
-		claims.ID == "" ||
-		claims.Realm != expectedRealm {
-		return nil, ErrInvalidToken
-	}
-
-	return claims, nil
+	return s.session.ParseAccessToken(raw, expectedRealm)
 }
 
 func (s *Service) IsRevoked(
 	ctx context.Context,
 	jti string,
 ) (bool, error) {
-	if s.tokens == nil {
-		return false, errors.New("token repository is not configured")
-	}
-
-	return s.tokens.IsAccessTokenRevoked(ctx, jti)
+	return s.session.IsRevoked(ctx, jti)
 }
 
+// issueTokens 按 realm 签发令牌对，主体固定为管理端用户。
 func (s *Service) issueTokens(
 	u *domainuser.User,
 	realm domainauth.Realm,
 ) (TokenPair, string, error) {
-	if s.cfg.JWTSecret == "" ||
-		s.cfg.AccessTTL <= 0 ||
-		s.cfg.RefreshTTL <= 0 {
-		return TokenPair{}, "", errors.New(
-			"JWT authentication configuration is incomplete",
-		)
-	}
-
-	now := time.Now()
-	sessionID := uuid.NewString()
-	accessExpiresAt := now.Add(s.cfg.AccessTTL)
-
-	claims := AccessClaims{
-		UserID:    u.ID,
-		Username:  u.Username,
-		TokenType: TokenTypeAccess,
-		Realm:     realm,
-		SessionID: sessionID,
-		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:    "medical-backend",
-			Subject:   fmt.Sprintf("%d", u.ID),
-			ID:        uuid.NewString(),
-			IssuedAt:  jwt.NewNumericDate(now),
-			ExpiresAt: jwt.NewNumericDate(accessExpiresAt),
-		},
-	}
-
-	accessToken, err := jwt.NewWithClaims(
-		jwt.SigningMethodHS256,
-		claims,
-	).SignedString([]byte(s.cfg.JWTSecret))
-	if err != nil {
-		return TokenPair{}, "", err
-	}
-
-	refreshBytes := make([]byte, 32)
-	if _, err := rand.Read(refreshBytes); err != nil {
-		return TokenPair{}, "", err
-	}
-
-	return TokenPair{
-		AccessToken:      accessToken,
-		RefreshToken:     hex.EncodeToString(refreshBytes),
-		AccessExpiresAt:  accessExpiresAt,
-		RefreshExpiresAt: now.Add(s.cfg.RefreshTTL),
-	}, sessionID, nil
+	return s.session.Issue(realm, authsession.Subject{
+		ID:   u.ID,
+		Name: u.Username,
+	})
 }
 
+// saveRefreshSession 写入 refresh 会话，主体信息取管理端用户名。
 func (s *Service) saveRefreshSession(
 	ctx context.Context,
 	pair TokenPair,
@@ -362,32 +224,8 @@ func (s *Service) saveRefreshSession(
 	u *domainuser.User,
 	realm domainauth.Realm,
 ) error {
-	ttlSeconds := int64(
-		time.Until(pair.RefreshExpiresAt) / time.Second,
-	)
-	if ttlSeconds < 1 {
-		ttlSeconds = 1
-	}
-
-	err := s.tokens.SaveRefreshSession(
-		ctx,
-		port.RefreshSession{
-			TokenHash: hashRefreshToken(pair.RefreshToken),
-			SessionID: sessionID,
-			UserID:    u.ID,
-			Username:  u.Username,
-			Realm:     realm,
-		},
-		ttlSeconds,
-	)
-	if err != nil {
-		return fmt.Errorf("save refresh session: %w", err)
-	}
-
-	return nil
-}
-
-func hashRefreshToken(token string) string {
-	sum := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(sum[:])
+	return s.session.SaveRefreshSession(ctx, pair, sessionID, authsession.Subject{
+		ID:   u.ID,
+		Name: u.Username,
+	}, realm)
 }

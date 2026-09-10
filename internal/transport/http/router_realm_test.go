@@ -57,6 +57,8 @@ func newRealmTestRouter(t *testing.T, realm domainauth.Realm) (*gin.Engine, stri
 		nil, // doctorRepository
 		nil, // scheduleRepository
 		nil, // idempotencyStore
+		nil, // patientRepository
+		nil, // wechatAuthenticator
 	)
 
 	claims := &userservice.AccessClaims{
@@ -209,32 +211,93 @@ func TestRouterMisRoutesRejectAnonymousRequests(t *testing.T) {
 	}
 }
 
-// TestRouterDoesNotGuardPatientPathsWithMisRealm 断言访问令牌校验已从引擎级中间件
-// 改为按认证域挂在路由组上：未注册的 /api/v1/patient/* 不会被管理域校验拦成 401，
-// 而是走 gin 的 no-route 404，从而为后续患者域路由（realm=patient）预留空间。
-func TestRouterDoesNotGuardPatientPathsWithMisRealm(t *testing.T) {
+// TestRouterPatientMeIsGuardedByPatientRealm 断言 /api/v1/patient/me 已挂载
+// realm=patient 的令牌校验：匿名与 realm=mis 的合法令牌都必须返回
+// 401 AUTH_INVALID_TOKEN，且响应文案按患者域给出（证明请求到达患者域中间件，
+// 而不是落入 no-route 404，也不是被管理域中间件处理）。
+func TestRouterPatientMeIsGuardedByPatientRealm(t *testing.T) {
 	router, misToken := newRealmTestRouter(t, domainauth.RealmMis)
 
-	for _, route := range []struct {
-		method string
-		path   string
-	}{
-		{http.MethodGet, "/api/v1/patient/me"},
-		{http.MethodPost, "/api/v1/patient/cards"},
-	} {
-		for _, token := range []string{"", misToken} {
-			w := performRealmRequest(router, route.method, route.path, token)
+	for _, token := range []string{"", misToken} {
+		w := performRealmRequest(
+			router,
+			http.MethodGet,
+			"/api/v1/patient/me",
+			token,
+		)
 
-			if w.Code != http.StatusNotFound {
-				t.Errorf(
-					"%s %s（携带令牌=%t）status = %d, want 404; body=%s",
-					route.method,
-					route.path,
-					token != "",
-					w.Code,
-					w.Body.String(),
-				)
-			}
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf(
+				"GET /api/v1/patient/me（携带令牌=%t）status = %d, want 401; body=%s",
+				token != "",
+				w.Code,
+				w.Body.String(),
+			)
+			continue
 		}
+		body := decodeRealmRouterBody(t, w)
+		if body["code"] != "AUTH_INVALID_TOKEN" {
+			t.Errorf(
+				"GET /api/v1/patient/me（携带令牌=%t）code = %v, want AUTH_INVALID_TOKEN",
+				token != "",
+				body["code"],
+			)
+		}
+		if body["message"] != "患者访问令牌无效" {
+			t.Errorf(
+				"GET /api/v1/patient/me（携带令牌=%t）message = %v, want 患者访问令牌无效",
+				token != "",
+				body["message"],
+			)
+		}
+	}
+}
+
+// TestRouterUnregisteredPatientPathsStayNotFound 断言 realm 校验只作用于已注册路由：
+// 尚未实现的患者域路径（就诊卡接口属于后续工作包）仍由 gin 返回 404。
+func TestRouterUnregisteredPatientPathsStayNotFound(t *testing.T) {
+	router, misToken := newRealmTestRouter(t, domainauth.RealmMis)
+
+	for _, token := range []string{"", misToken} {
+		w := performRealmRequest(
+			router,
+			http.MethodGet,
+			"/api/v1/patient/cards",
+			token,
+		)
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf(
+				"GET /api/v1/patient/cards（携带令牌=%t）status = %d, want 404; body=%s",
+				token != "",
+				w.Code,
+				w.Body.String(),
+			)
+		}
+	}
+}
+
+// TestRouterPatientAuthRejectsMisRealmAccessToken 断言患者端认证接口使用严格语义：
+// 用管理端 realm 的令牌调用 logout 必须返回 401 AUTH_INVALID_TOKEN，
+// 不得把管理端令牌当患者主体解释（spec/04-api-contract.md §12.5）。
+func TestRouterPatientAuthRejectsMisRealmAccessToken(t *testing.T) {
+	router, misToken := newRealmTestRouter(t, domainauth.RealmMis)
+
+	w := performRealmRequest(
+		router,
+		http.MethodPost,
+		"/api/v1/patient/auth/logout",
+		misToken,
+	)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf(
+			"POST /api/v1/patient/auth/logout status = %d, want 401; body=%s",
+			w.Code,
+			w.Body.String(),
+		)
+	}
+	if code := decodeRealmRouterBody(t, w)["code"]; code != "AUTH_INVALID_TOKEN" {
+		t.Errorf("code = %v, want AUTH_INVALID_TOKEN", code)
 	}
 }

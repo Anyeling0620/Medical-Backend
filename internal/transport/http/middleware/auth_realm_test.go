@@ -31,6 +31,15 @@ func (r realmMiddlewareTokenRepo) IsAccessTokenRevoked(
 	return r.revoked, nil
 }
 
+// DeleteRefreshSessionBySessionID 让中间件测试桩满足 TokenRepository 的全部方法：
+// 本桩不保存会话，因此按契约返回 (false, nil)，避免内嵌 nil 接口时调用即 panic。
+func (r realmMiddlewareTokenRepo) DeleteRefreshSessionBySessionID(
+	_ context.Context,
+	_ string,
+) (bool, error) {
+	return false, nil
+}
+
 // signMiddlewareAccessToken 用中间件测试密钥签发指定 realm 的 access token；
 // realm 传空字符串可模拟改造前未携带 realm 字段的旧令牌。
 func signMiddlewareAccessToken(t *testing.T, realm domainauth.Realm) string {

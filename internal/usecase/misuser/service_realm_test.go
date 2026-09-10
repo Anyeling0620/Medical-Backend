@@ -11,6 +11,7 @@ import (
 	domainauth "Medical-Web-Backend/internal/domain/auth"
 	domainuser "Medical-Web-Backend/internal/domain/user"
 	"Medical-Web-Backend/internal/port"
+	"Medical-Web-Backend/internal/usecase/authsession"
 )
 
 // realmTestJWTSecret 是本文件所有用例共用的签名密钥。
@@ -22,10 +23,15 @@ const realmTestJWTSecret = "misuser-realm-test-secret"
 type realmTestTokenRepository struct {
 	port.TokenRepository
 
-	sessions map[string]port.RefreshSession // tokenHash -> refresh 会话
-	saved    []port.RefreshSession          // SaveRefreshSession 入参记录
-	deleted  []string                       // DeleteRefreshSession 的 tokenHash 记录
-	revoked  []string                       // RevokeAccessToken 的 jti 记录
+	sessions   map[string]port.RefreshSession // tokenHash -> refresh 会话
+	saved      []port.RefreshSession          // SaveRefreshSession 入参记录
+	deleted    []string                       // DeleteRefreshSession 的 tokenHash 记录
+	revoked    []string                       // RevokeAccessToken 的 jti 记录
+	sidDeleted []string                       // 按 sessionID 命中删除的记录
+	sidMissed  []string                       // 按 sessionID 未命中的记录
+	// deletedSIDs 与 deleted 一一对应，记录 DeleteRefreshSession 收到的 sessionID：
+	// 生产实现靠它一并删除反查索引，桩若丢弃该参数就无法测出相关回归。
+	deletedSIDs []string
 
 	// getHook 非 nil 时取代默认读取逻辑，用于精确构造读取 (会话, 错误) 组合，
 	// 覆盖“会话不存在”“Redis 读取失败”等分支。
@@ -66,10 +72,35 @@ func (r *realmTestTokenRepository) GetRefreshSession(
 func (r *realmTestTokenRepository) DeleteRefreshSession(
 	_ context.Context,
 	tokenHash string,
+	sessionID string,
 ) error {
 	r.deleted = append(r.deleted, tokenHash)
+	r.deletedSIDs = append(r.deletedSIDs, sessionID)
 	delete(r.sessions, tokenHash)
 	return nil
+}
+
+// DeleteRefreshSessionBySessionID 按 sessionID 在内存里反查会话并删除，
+// 对应生产实现里 Redis 的 sessionID -> tokenHash 反查索引：
+// 命中返回 (true, nil)，未命中返回 (false, nil)（登出保持幂等）。
+func (r *realmTestTokenRepository) DeleteRefreshSessionBySessionID(
+	_ context.Context,
+	sessionID string,
+) (bool, error) {
+	if sessionID == "" {
+		return false, nil
+	}
+	for tokenHash, session := range r.sessions {
+		if session.SessionID != sessionID {
+			continue
+		}
+		r.deleted = append(r.deleted, tokenHash)
+		r.sidDeleted = append(r.sidDeleted, sessionID)
+		delete(r.sessions, tokenHash)
+		return true, nil
+	}
+	r.sidMissed = append(r.sidMissed, sessionID)
+	return false, nil
 }
 
 func (r *realmTestTokenRepository) RevokeAccessToken(
@@ -273,23 +304,23 @@ func TestRefreshRejectsCrossRealmSession(t *testing.T) {
 	)
 
 	tokens := newRealmTestTokenRepository()
-	tokens.sessions[hashRefreshToken(patientRefresh)] = port.RefreshSession{
-		TokenHash: hashRefreshToken(patientRefresh),
+	tokens.sessions[authsession.HashRefreshToken(patientRefresh)] = port.RefreshSession{
+		TokenHash: authsession.HashRefreshToken(patientRefresh),
 		SessionID: "session-patient",
 		UserID:    7,
 		Username:  "mis-admin",
 		Realm:     domainauth.RealmPatient,
 	}
-	tokens.sessions[hashRefreshToken(misRefresh)] = port.RefreshSession{
-		TokenHash: hashRefreshToken(misRefresh),
+	tokens.sessions[authsession.HashRefreshToken(misRefresh)] = port.RefreshSession{
+		TokenHash: authsession.HashRefreshToken(misRefresh),
 		SessionID: "session-mis",
 		UserID:    7,
 		Username:  "mis-admin",
 		Realm:     domainauth.RealmMis,
 	}
 	// 改造前写入 Redis 的旧会话没有 realm 字段，反序列化后为零值。
-	tokens.sessions[hashRefreshToken(legacyRefresh)] = port.RefreshSession{
-		TokenHash: hashRefreshToken(legacyRefresh),
+	tokens.sessions[authsession.HashRefreshToken(legacyRefresh)] = port.RefreshSession{
+		TokenHash: authsession.HashRefreshToken(legacyRefresh),
 		SessionID: "session-legacy",
 		UserID:    7,
 		Username:  "mis-admin",
@@ -312,7 +343,7 @@ func TestRefreshRejectsCrossRealmSession(t *testing.T) {
 	if len(tokens.saved) != 0 {
 		t.Errorf("跨域刷新不得保存新会话，实际保存 %d 条", len(tokens.saved))
 	}
-	if _, ok := tokens.sessions[hashRefreshToken(patientRefresh)]; !ok {
+	if _, ok := tokens.sessions[authsession.HashRefreshToken(patientRefresh)]; !ok {
 		t.Error("患者域 refresh 会话不应被撤销")
 	}
 
@@ -334,8 +365,11 @@ func TestRefreshRejectsCrossRealmSession(t *testing.T) {
 	if got := tokens.saved[0].Realm; got != domainauth.RealmPatient {
 		t.Errorf("轮换后的 refresh 会话 realm = %q，期望 %q", got, domainauth.RealmPatient)
 	}
-	if !realmTestContains(tokens.deleted, hashRefreshToken(patientRefresh)) {
+	if !realmTestContains(tokens.deleted, authsession.HashRefreshToken(patientRefresh)) {
 		t.Error("refresh token rotation 应删除旧会话")
+	}
+	if !realmTestContains(tokens.deletedSIDs, "session-patient") {
+		t.Errorf("轮换必须把会话 sessionID 传给仓储，实际 %v", tokens.deletedSIDs)
 	}
 
 	// 管理域仍能用自己的 refresh token 刷新（隔离不影响本域）。
@@ -378,8 +412,8 @@ func TestLogoutIsolatesRealmSessions(t *testing.T) {
 	const patientRefresh = "patient-refresh-token"
 
 	tokens := newRealmTestTokenRepository()
-	tokens.sessions[hashRefreshToken(patientRefresh)] = port.RefreshSession{
-		TokenHash: hashRefreshToken(patientRefresh),
+	tokens.sessions[authsession.HashRefreshToken(patientRefresh)] = port.RefreshSession{
+		TokenHash: authsession.HashRefreshToken(patientRefresh),
 		SessionID: "session-patient",
 		UserID:    7,
 		Username:  "mis-admin",
@@ -394,10 +428,10 @@ func TestLogoutIsolatesRealmSessions(t *testing.T) {
 	if err := service.Logout(ctx, misAccess, patientRefresh, domainauth.RealmMis); err != nil {
 		t.Fatalf("管理端登出应幂等成功，实际 err=%v", err)
 	}
-	if realmTestContains(tokens.deleted, hashRefreshToken(patientRefresh)) {
+	if realmTestContains(tokens.deleted, authsession.HashRefreshToken(patientRefresh)) {
 		t.Error("管理端登出不得删除患者域 refresh 会话")
 	}
-	if _, ok := tokens.sessions[hashRefreshToken(patientRefresh)]; !ok {
+	if _, ok := tokens.sessions[authsession.HashRefreshToken(patientRefresh)]; !ok {
 		t.Error("患者域 refresh 会话应仍在存储中")
 	}
 	if len(tokens.revoked) != 1 || tokens.revoked[0] != "realm-test-jti-mis" {
@@ -419,8 +453,8 @@ func TestLogoutIsolatesRealmSessions(t *testing.T) {
 
 	// 场景 3（回归）：realm 匹配时 refresh 会话必须被撤销。
 	const misRefresh = "mis-refresh-token"
-	tokens.sessions[hashRefreshToken(misRefresh)] = port.RefreshSession{
-		TokenHash: hashRefreshToken(misRefresh),
+	tokens.sessions[authsession.HashRefreshToken(misRefresh)] = port.RefreshSession{
+		TokenHash: authsession.HashRefreshToken(misRefresh),
 		SessionID: "session-mis",
 		UserID:    7,
 		Username:  "mis-admin",
@@ -429,7 +463,7 @@ func TestLogoutIsolatesRealmSessions(t *testing.T) {
 	if err := service.Logout(ctx, "", misRefresh, domainauth.RealmMis); err != nil {
 		t.Fatalf("管理端登出应成功，实际 err=%v", err)
 	}
-	if !realmTestContains(tokens.deleted, hashRefreshToken(misRefresh)) {
+	if !realmTestContains(tokens.deleted, authsession.HashRefreshToken(misRefresh)) {
 		t.Error("realm 匹配时必须撤销 refresh 会话")
 	}
 
@@ -452,7 +486,7 @@ func TestLogoutIsolatesRealmSessions(t *testing.T) {
 	if len(tokens.revoked) != revokedBefore {
 		t.Errorf("跨域登出不得撤销 access token，实际 %v", tokens.revoked)
 	}
-	if _, ok := tokens.sessions[hashRefreshToken(patientRefresh)]; !ok {
+	if _, ok := tokens.sessions[authsession.HashRefreshToken(patientRefresh)]; !ok {
 		t.Error("患者域 refresh 会话应仍在存储中")
 	}
 }

@@ -22,6 +22,15 @@ func NewApp(cfg config.Config) (*App, error) {
 		return nil, fmt.Errorf("HTTP_PORT must be between 1 and 65535")
 	}
 
+	// 生产环境必须配置微信登录凭据：openid 只能由微信签发，
+	// 缺少凭据时患者登录不可用，属于启动期配置错误而不是运行期偶发故障。
+	if cfg.App.Env == "production" &&
+		(cfg.WeChat.AppID == "" || cfg.WeChat.Secret == "") {
+		return nil, fmt.Errorf(
+			"WECHAT_APPID and WECHAT_SECRET must be configured in production",
+		)
+	}
+
 	// 判断是否为生产环境
 	if cfg.App.Env == "production" {
 		gin.SetMode(gin.ReleaseMode)
@@ -49,6 +58,8 @@ func NewApp(cfg config.Config) (*App, error) {
 		repo.NewPostgresDoctorRepository(connectedClients.postgres),
 		repo.NewPostgresScheduleRepository(connectedClients.postgres),
 		repo.NewRedisIdempotencyStore(connectedClients.redis),
+		repo.NewPostgresPatientRepository(connectedClients.postgres),
+		repo.NewWeChatCode2SessionClient(cfg.WeChat.AppID, cfg.WeChat.Secret),
 	)
 
 	return &App{cfg: cfg, server: server, clients: connectedClients, dependencies: dependencies}, nil

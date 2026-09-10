@@ -18,6 +18,12 @@ var anonymousAllowedRoutePaths = map[string]bool{
 	"/api/v1/mis/auth/login":   true,
 	"/api/v1/mis/auth/refresh": true,
 	"/api/v1/mis/auth/logout":  true,
+	// 患者端认证接口自带凭据校验：wechat-login 用微信 code，
+	// refresh 用 refresh token，logout 在 handler 内按严格语义校验患者 access token，
+	// 因此都不挂 RequireAccessToken（spec/04-api-contract.md §7.1、§7.2）。
+	"/api/v1/patient/auth/wechat-login": true,
+	"/api/v1/patient/auth/refresh":      true,
+	"/api/v1/patient/auth/logout":       true,
 }
 
 // resolveRouteParams 把 gin 路由模板中的参数段替换为可请求的占位值，

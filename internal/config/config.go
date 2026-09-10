@@ -17,6 +17,7 @@ type Config struct {
 	Postgres PostgresConfig
 	MinIO    MinIOConfig
 	Auth     AuthConfig
+	WeChat   WeChatConfig
 }
 
 type AppConfig struct {
@@ -47,6 +48,14 @@ type MinIOConfig struct {
 	Endpoint string `env:"MINIO_ENDPOINT" envDefault:"localhost:9000"`
 	UseSSL   bool   `env:"MINIO_USE_SSL" envDefault:"false"`
 	Bucket   string `env:"MINIO_BUCKET" envDefault:"medical"`
+}
+
+// WeChatConfig 是微信小程序登录（code2Session）所需的应用凭据。
+// 生产环境必须配置；开发环境允许为空，此时微信登录返回 502 DEPENDENCY_UNAVAILABLE，
+// 登录流程本身保持可用（openid 只能由微信签发，不提供本地直通实现）。
+type WeChatConfig struct {
+	AppID  string `env:"WECHAT_APPID"`
+	Secret string `env:"WECHAT_SECRET"`
 }
 
 func Load() (Config, error) {
