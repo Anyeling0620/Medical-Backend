@@ -47,6 +47,8 @@ type patientAuthHandlerTokenRepo struct {
 
 	// getErr 非 nil 时 GetRefreshSession 恒定失败，用于模拟 Redis 不可用。
 	getErr error
+	// getCalls 记录 GetRefreshSession 的调用次数，用于断言实现没有回退到另一条令牌通道。
+	getCalls int
 	// sidErr 非 nil 时 DeleteRefreshSessionBySessionID 恒定失败。
 	sidErr error
 }
@@ -68,6 +70,7 @@ func (r *patientAuthHandlerTokenRepo) GetRefreshSession(
 	_ context.Context,
 	tokenHash string,
 ) (*port.RefreshSession, error) {
+	r.getCalls++
 	if r.getErr != nil {
 		return nil, r.getErr
 	}
@@ -375,21 +378,49 @@ func setCookieByName(w *httptest.ResponseRecorder, name string) *http.Cookie {
 // parsePatientExpiresAt 断言 accessExpiresAt 是可解析的 RFC3339 时间串。
 func parsePatientExpiresAt(t *testing.T, value any) time.Time {
 	t.Helper()
+	return parsePatientRFC3339(t, "accessExpiresAt", value)
+}
+
+// parsePatientRFC3339 断言指定响应字段是可解析的非空 RFC3339 时间串，
+// 供 accessExpiresAt / refreshExpiresAt 等字段复用（契约 §7.1、§7.2）。
+func parsePatientRFC3339(t *testing.T, field string, value any) time.Time {
+	t.Helper()
 	text, ok := value.(string)
 	if !ok || text == "" {
-		t.Fatalf("accessExpiresAt = %v，期望非空 RFC3339 字符串", value)
+		t.Fatalf("%s = %v，期望非空 RFC3339 字符串", field, value)
 	}
 	parsed, err := time.Parse(time.RFC3339, text)
 	if err != nil {
-		t.Fatalf("accessExpiresAt = %q，无法按 RFC3339 解析：%v", text, err)
+		t.Fatalf("%s = %q，无法按 RFC3339 解析：%v", field, text, err)
 	}
 	return parsed
+}
+
+// refreshResponseToken 取出响应体里的 refreshToken 字段；缺失或非字符串时直接失败，
+// 避免用例只断言 Cookie 通道而漏掉小程序通道（契约 §1.2、§7.2）。
+func refreshResponseToken(t *testing.T, body map[string]any) string {
+	t.Helper()
+	token, ok := body["refreshToken"].(string)
+	if !ok || token == "" {
+		t.Fatalf("refreshToken = %v，期望非空字符串", body["refreshToken"])
+	}
+	return token
+}
+
+// withRefreshCookie 为请求附加浏览器通道的 refresh Cookie。
+func withRefreshCookie(value string) func(*http.Request) {
+	return func(req *http.Request) {
+		req.AddCookie(&http.Cookie{
+			Name:  authsession.RefreshCookieName,
+			Value: value,
+		})
+	}
 }
 
 // --- POST /api/v1/patient/auth/wechat-login ---
 
 // TestPatientWeChatLoginSuccessResponseShape 覆盖登录成功：响应字段齐全、
-// 不泄露 refresh token，且 refresh token 只经 HttpOnly Cookie 下发。
+// refresh token 同时经 HttpOnly Cookie 与响应体下发（契约 §1.2、§7.1）。
 func TestPatientWeChatLoginSuccessResponseShape(t *testing.T) {
 	env := newPatientAuthHandlerEnv(t)
 	env.repo.seedCard(20, "13800138000")
@@ -440,7 +471,8 @@ func TestPatientWeChatLoginSuccessResponseShape(t *testing.T) {
 		t.Error("患者摘要不得包含 openId")
 	}
 
-	// refresh token 只能出现在 Cookie 中。
+	// refresh token 同时经 HttpOnly Cookie（浏览器）与响应体（小程序）下发：
+	// 两条通道必须是同一个轮换令牌，Cookie 的 HttpOnly 等属性保持不变（契约 §1.2、§7.1）。
 	refreshCookie := setCookieByName(w, authsession.RefreshCookieName)
 	if refreshCookie == nil {
 		t.Fatalf("缺少 %s Cookie；Set-Cookie=%v", authsession.RefreshCookieName, w.Header().Values("Set-Cookie"))
@@ -451,16 +483,63 @@ func TestPatientWeChatLoginSuccessResponseShape(t *testing.T) {
 	if refreshCookie.Value == "" {
 		t.Error("refresh Cookie 不得为空")
 	}
-	if _, exists := body["refreshToken"]; exists {
-		t.Error("响应体不得包含 refreshToken 字段")
-	}
-	if strings.Contains(w.Body.String(), refreshCookie.Value) {
-		t.Error("响应体不得包含 refresh token 原文")
+	if bodyToken := refreshResponseToken(t, body); bodyToken != refreshCookie.Value {
+		t.Errorf(
+			"响应体 refreshToken = %q，期望等于 refresh Cookie 的值 %q",
+			bodyToken,
+			refreshCookie.Value,
+		)
 	}
 
 	accessCookie := setCookieByName(w, authsession.AccessCookieName)
 	if accessCookie == nil || !accessCookie.HttpOnly {
 		t.Errorf("缺少 HttpOnly 的 %s Cookie，实际 %+v", authsession.AccessCookieName, accessCookie)
+	}
+}
+
+// TestPatientWeChatLoginReturnsRefreshTokenInBody 覆盖小程序无 Cookie 通道：
+// 登录响应体必须回传与 refresh Cookie 完全一致的新 refreshToken，
+// 且 refreshExpiresAt 可解析为 RFC3339 并晚于 accessExpiresAt（契约 §1.2、§7.1）。
+func TestPatientWeChatLoginReturnsRefreshTokenInBody(t *testing.T) {
+	env := newPatientAuthHandlerEnv(t)
+
+	w := env.request(
+		http.MethodPost,
+		"/api/v1/patient/auth/wechat-login",
+		`{"code":"wx_code_abc123"}`,
+		nil,
+	)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	body := decodeBody(t, w)
+
+	refreshCookie := setCookieByName(w, authsession.RefreshCookieName)
+	if refreshCookie == nil {
+		t.Fatalf("缺少 %s Cookie；Set-Cookie=%v", authsession.RefreshCookieName, w.Header().Values("Set-Cookie"))
+	}
+
+	bodyToken := refreshResponseToken(t, body)
+	if bodyToken != refreshCookie.Value {
+		t.Errorf(
+			"响应体 refreshToken = %q，期望等于 refresh Cookie 的值 %q",
+			bodyToken,
+			refreshCookie.Value,
+		)
+	}
+	// 回传的令牌必须真的对应服务端会话，而不是仅仅回显了一个字符串。
+	if _, ok := env.tokens.sessions[authsession.HashRefreshToken(bodyToken)]; !ok {
+		t.Error("响应体回传的 refresh token 必须对应已写入的刷新会话")
+	}
+
+	accessExpiresAt := parsePatientRFC3339(t, "accessExpiresAt", body["accessExpiresAt"])
+	refreshExpiresAt := parsePatientRFC3339(t, "refreshExpiresAt", body["refreshExpiresAt"])
+	if !refreshExpiresAt.After(accessExpiresAt) {
+		t.Errorf(
+			"refreshExpiresAt = %v，期望晚于 accessExpiresAt = %v",
+			refreshExpiresAt,
+			accessExpiresAt,
+		)
 	}
 }
 
@@ -626,7 +705,7 @@ func TestPatientWeChatLoginWeChatCodeInvalidUnprocessable(t *testing.T) {
 // --- POST /api/v1/patient/auth/refresh ---
 
 // TestPatientRefreshWithBodyToken 覆盖请求体携带 refresh token 的成功刷新：
-// 轮换后的 refresh token 仍只经 Cookie 下发。
+// 轮换后的 refresh token 同时写入 Cookie 与响应体（契约 §7.2）。
 func TestPatientRefreshWithBodyToken(t *testing.T) {
 	env := newPatientAuthHandlerEnv(t)
 	login := env.login(t)
@@ -646,9 +725,9 @@ func TestPatientRefreshWithBodyToken(t *testing.T) {
 		t.Errorf("accessToken = %v，期望非空字符串", body["accessToken"])
 	}
 	parsePatientExpiresAt(t, body["accessExpiresAt"])
-	if _, exists := body["refreshToken"]; exists {
-		t.Error("响应体不得包含 refreshToken 字段")
-	}
+	// 小程序无 Cookie 通道，轮换后的 refresh token 必须回传响应体（契约 §7.2）。
+	bodyRefreshToken := refreshResponseToken(t, body)
+	parsePatientRFC3339(t, "refreshExpiresAt", body["refreshExpiresAt"])
 
 	refreshCookie := setCookieByName(w, authsession.RefreshCookieName)
 	if refreshCookie == nil || !refreshCookie.HttpOnly {
@@ -656,6 +735,13 @@ func TestPatientRefreshWithBodyToken(t *testing.T) {
 	}
 	if refreshCookie.Value == login.Tokens.RefreshToken {
 		t.Error("刷新必须轮换 refresh token，不得复用旧值")
+	}
+	if bodyRefreshToken != refreshCookie.Value {
+		t.Errorf(
+			"响应体 refreshToken = %q，期望等于轮换后 refresh Cookie 的值 %q",
+			bodyRefreshToken,
+			refreshCookie.Value,
+		)
 	}
 	if !containsString(env.tokens.deleted, authsession.HashRefreshToken(login.Tokens.RefreshToken)) {
 		t.Error("旧 refresh 会话必须被撤销")
@@ -742,6 +828,526 @@ func TestPatientRefreshInvalidTokenUnauthorized(t *testing.T) {
 				tc.mutate,
 			)
 			assertErrorStatus(t, w, http.StatusUnauthorized, "AUTH_INVALID_REFRESH_TOKEN")
+		})
+	}
+}
+
+// TestPatientRefreshFallsBackToCookieWhenBodyTokenInvalid 覆盖兼容性回退：
+// 请求体令牌无效时必须继续尝试 Cookie 通道，Cookie 有效则 200 并轮换该会话，
+// 不能因为请求体令牌失效就把持有有效 Cookie 的浏览器判成未认证（契约 §7.2）。
+func TestPatientRefreshFallsBackToCookieWhenBodyTokenInvalid(t *testing.T) {
+	env := newPatientAuthHandlerEnv(t)
+	login := env.login(t)
+
+	w := env.request(
+		http.MethodPost,
+		"/api/v1/patient/auth/refresh",
+		`{"refreshToken":"unknown-refresh-token"}`,
+		withRefreshCookie(login.Tokens.RefreshToken),
+	)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	body := decodeBody(t, w)
+
+	refreshCookie := setCookieByName(w, authsession.RefreshCookieName)
+	if refreshCookie == nil {
+		t.Fatalf("刷新后必须下发 %s Cookie", authsession.RefreshCookieName)
+	}
+	if refreshCookie.Value == login.Tokens.RefreshToken {
+		t.Error("回退 Cookie 成功后必须轮换 Cookie 会话")
+	}
+	if !containsString(env.tokens.deleted, authsession.HashRefreshToken(login.Tokens.RefreshToken)) {
+		t.Errorf("Cookie 会话必须被撤销，实际 deleted=%v", env.tokens.deleted)
+	}
+	if bodyToken := refreshResponseToken(t, body); bodyToken != refreshCookie.Value {
+		t.Errorf(
+			"响应体 refreshToken = %q，期望等于轮换后 refresh Cookie 的值 %q",
+			bodyToken,
+			refreshCookie.Value,
+		)
+	}
+}
+
+// TestPatientRefreshWithBodyTokenIgnoresInvalidCookie 覆盖反向组合：
+// 请求体令牌有效、Cookie 无效或已过期时，请求体通道照常成功 200（契约 §7.2）。
+func TestPatientRefreshWithBodyTokenIgnoresInvalidCookie(t *testing.T) {
+	env := newPatientAuthHandlerEnv(t)
+	login := env.login(t)
+
+	w := env.request(
+		http.MethodPost,
+		"/api/v1/patient/auth/refresh",
+		`{"refreshToken":"`+login.Tokens.RefreshToken+`"}`,
+		withRefreshCookie("expired-or-unknown-refresh-token"),
+	)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	body := decodeBody(t, w)
+
+	refreshCookie := setCookieByName(w, authsession.RefreshCookieName)
+	if refreshCookie == nil {
+		t.Fatalf("刷新后必须下发 %s Cookie", authsession.RefreshCookieName)
+	}
+	bodyToken := refreshResponseToken(t, body)
+	if bodyToken != refreshCookie.Value {
+		t.Errorf(
+			"响应体 refreshToken = %q，期望等于轮换后 refresh Cookie 的值 %q",
+			bodyToken,
+			refreshCookie.Value,
+		)
+	}
+	if bodyToken == login.Tokens.RefreshToken {
+		t.Error("请求体通道必须轮换出新令牌")
+	}
+}
+
+// TestPatientRefreshBothChannelsInvalidUnauthorized 覆盖两条通道都无效：
+// 请求体与 Cookie 都拿不出有效令牌时才返回 401 AUTH_INVALID_REFRESH_TOKEN，
+// 且不得产生任何会话副作用或下发 Cookie（契约 §7.2）。
+func TestPatientRefreshBothChannelsInvalidUnauthorized(t *testing.T) {
+	env := newPatientAuthHandlerEnv(t)
+
+	w := env.request(
+		http.MethodPost,
+		"/api/v1/patient/auth/refresh",
+		`{"refreshToken":"unknown-refresh-token"}`,
+		withRefreshCookie("another-unknown-refresh-token"),
+	)
+	assertErrorStatus(t, w, http.StatusUnauthorized, "AUTH_INVALID_REFRESH_TOKEN")
+
+	if len(env.tokens.deleted) != 0 {
+		t.Errorf("凭据无效不得产生轮换副作用，实际 deleted=%v", env.tokens.deleted)
+	}
+	if cookies := w.Result().Cookies(); len(cookies) != 0 {
+		t.Errorf("凭据无效不得下发 Cookie，实际 %v", cookies)
+	}
+}
+
+// TestPatientRefreshTreatsWhitespaceBodyTokenAsAbsent 覆盖空白值语义：
+// 请求体 refreshToken 为纯空白时视为未携带，必须能回退到 Cookie 通道，
+// 而不是把空白串当成凭据去校验后直接 401（契约 §7.2「空请求体等同只带 Cookie」）。
+func TestPatientRefreshTreatsWhitespaceBodyTokenAsAbsent(t *testing.T) {
+	env := newPatientAuthHandlerEnv(t)
+	login := env.login(t)
+
+	w := env.request(
+		http.MethodPost,
+		"/api/v1/patient/auth/refresh",
+		`{"refreshToken":"   "}`,
+		withRefreshCookie(login.Tokens.RefreshToken),
+	)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	body := decodeBody(t, w)
+
+	// 只有 Cookie 一条候选通道，因此只应发生一次轮换。
+	if len(env.tokens.deleted) != 1 {
+		t.Errorf("空白请求体令牌不得进入候选列表，实际 deleted=%v", env.tokens.deleted)
+	}
+	if !containsString(env.tokens.deleted, authsession.HashRefreshToken(login.Tokens.RefreshToken)) {
+		t.Errorf("Cookie 会话必须被轮换，实际 deleted=%v", env.tokens.deleted)
+	}
+	refreshCookie := setCookieByName(w, authsession.RefreshCookieName)
+	if refreshCookie == nil {
+		t.Fatalf("刷新后必须下发 %s Cookie", authsession.RefreshCookieName)
+	}
+	if bodyToken := refreshResponseToken(t, body); bodyToken != refreshCookie.Value {
+		t.Errorf(
+			"响应体 refreshToken = %q，期望等于轮换后 refresh Cookie 的值 %q",
+			bodyToken,
+			refreshCookie.Value,
+		)
+	}
+}
+
+// TestPatientRefreshDependencyFailureDoesNotFallBackToCookie 覆盖依赖故障的优先级：
+// 会话存储读取失败必须立即上报 502 DEPENDENCY_UNAVAILABLE，不得继续尝试 Cookie 通道，
+// 更不得把故障伪装成 401 让客户端误以为需要重新登录（契约 §7.2、§10）。
+func TestPatientRefreshDependencyFailureDoesNotFallBackToCookie(t *testing.T) {
+	env := newPatientAuthHandlerEnv(t)
+	login := env.login(t)
+	env.tokens.getErr = errors.New("redis unavailable")
+
+	w := env.request(
+		http.MethodPost,
+		"/api/v1/patient/auth/refresh",
+		`{"refreshToken":"`+login.Tokens.RefreshToken+`"}`,
+		withRefreshCookie(login.Tokens.RefreshToken),
+	)
+	assertErrorStatus(t, w, http.StatusBadGateway, "DEPENDENCY_UNAVAILABLE")
+
+	// 依赖故障必须立即结束候选循环：若实现继续尝试 Cookie 通道，这里会多读一次会话。
+	if env.tokens.getCalls != 1 {
+		t.Errorf("依赖故障时只应尝试一次会话读取，实际 %d 次", env.tokens.getCalls)
+	}
+	if len(env.tokens.deleted) != 0 {
+		t.Errorf("依赖故障不得产生轮换副作用，实际 deleted=%v", env.tokens.deleted)
+	}
+	if _, ok := env.tokens.sessions[authsession.HashRefreshToken(login.Tokens.RefreshToken)]; !ok {
+		t.Error("依赖故障时 Cookie 会话必须保持原状，不得被撤销")
+	}
+	if cookies := w.Result().Cookies(); len(cookies) != 0 {
+		t.Errorf("依赖故障不得下发新 Cookie，实际 %v", cookies)
+	}
+}
+
+// TestPatientRefreshWithBodyTokenRotatesAndReturnsToken 覆盖请求体通道的轮换语义：
+// 成功刷新后响应体 refreshToken 必须等于新下发的 refresh Cookie 值、不得等于旧令牌，
+// 且 refreshExpiresAt 可解析为 RFC3339 并晚于 accessExpiresAt（契约 §7.2）。
+func TestPatientRefreshWithBodyTokenRotatesAndReturnsToken(t *testing.T) {
+	env := newPatientAuthHandlerEnv(t)
+	login := env.login(t)
+
+	w := env.request(
+		http.MethodPost,
+		"/api/v1/patient/auth/refresh",
+		`{"refreshToken":"`+login.Tokens.RefreshToken+`"}`,
+		nil,
+	)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	body := decodeBody(t, w)
+
+	refreshCookie := setCookieByName(w, authsession.RefreshCookieName)
+	if refreshCookie == nil {
+		t.Fatalf("刷新后必须下发 %s Cookie", authsession.RefreshCookieName)
+	}
+	bodyToken := refreshResponseToken(t, body)
+	if bodyToken != refreshCookie.Value {
+		t.Errorf(
+			"响应体 refreshToken = %q，期望等于轮换后 refresh Cookie 的值 %q",
+			bodyToken,
+			refreshCookie.Value,
+		)
+	}
+	if bodyToken == login.Tokens.RefreshToken {
+		t.Error("响应体 refreshToken 必须是轮换后的新令牌，不得复用旧值")
+	}
+
+	accessExpiresAt := parsePatientRFC3339(t, "accessExpiresAt", body["accessExpiresAt"])
+	refreshExpiresAt := parsePatientRFC3339(t, "refreshExpiresAt", body["refreshExpiresAt"])
+	if !refreshExpiresAt.After(accessExpiresAt) {
+		t.Errorf(
+			"refreshExpiresAt = %v，期望晚于 accessExpiresAt = %v",
+			refreshExpiresAt,
+			accessExpiresAt,
+		)
+	}
+}
+
+// TestPatientRefreshWithCookieRotatesAndReturnsTokenInBody 覆盖浏览器 Cookie 通道：
+// 仅凭 Cookie 刷新时同样在响应体回传轮换后的 refreshToken，并与新 Cookie 一致
+// （小程序与浏览器共用同一响应结构，契约 §7.2）。
+func TestPatientRefreshWithCookieRotatesAndReturnsTokenInBody(t *testing.T) {
+	env := newPatientAuthHandlerEnv(t)
+	login := env.login(t)
+
+	w := env.request(
+		http.MethodPost,
+		"/api/v1/patient/auth/refresh",
+		"",
+		withRefreshCookie(login.Tokens.RefreshToken),
+	)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	body := decodeBody(t, w)
+
+	refreshCookie := setCookieByName(w, authsession.RefreshCookieName)
+	if refreshCookie == nil {
+		t.Fatalf("刷新后必须下发 %s Cookie", authsession.RefreshCookieName)
+	}
+	if refreshCookie.Value == login.Tokens.RefreshToken {
+		t.Error("Cookie 通道刷新必须轮换 refresh token，不得复用旧值")
+	}
+	if bodyToken := refreshResponseToken(t, body); bodyToken != refreshCookie.Value {
+		t.Errorf(
+			"响应体 refreshToken = %q，期望等于轮换后 refresh Cookie 的值 %q",
+			bodyToken,
+			refreshCookie.Value,
+		)
+	}
+	parsePatientRFC3339(t, "refreshExpiresAt", body["refreshExpiresAt"])
+}
+
+// TestPatientRefreshPrefersBodyTokenOverCookie 覆盖两条通道同时携带有效令牌：
+// 请求体优先，只轮换请求体令牌对应的会话；Cookie 中的旧会话必须保持可用且仍能继续刷新，
+// 否则浏览器会被小程序提交的请求体令牌提前踢下线（契约 §7.2）。
+func TestPatientRefreshPrefersBodyTokenOverCookie(t *testing.T) {
+	env := newPatientAuthHandlerEnv(t)
+	cookieLogin := env.login(t) // 浏览器会话：只经 Cookie 提交
+	bodyLogin := env.login(t)   // 小程序会话：经请求体提交
+
+	cookieHash := authsession.HashRefreshToken(cookieLogin.Tokens.RefreshToken)
+	bodyHash := authsession.HashRefreshToken(bodyLogin.Tokens.RefreshToken)
+	cookieSession, ok := env.tokens.sessions[cookieHash]
+	if !ok {
+		t.Fatal("前置：Cookie 会话必须已写入")
+	}
+	bodySession, ok := env.tokens.sessions[bodyHash]
+	if !ok {
+		t.Fatal("前置：请求体会话必须已写入")
+	}
+
+	w := env.request(
+		http.MethodPost,
+		"/api/v1/patient/auth/refresh",
+		`{"refreshToken":"`+bodyLogin.Tokens.RefreshToken+`"}`,
+		withRefreshCookie(cookieLogin.Tokens.RefreshToken),
+	)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	body := decodeBody(t, w)
+	newToken := refreshResponseToken(t, body)
+	newHash := authsession.HashRefreshToken(newToken)
+
+	// 被轮换的必须是请求体那条会话：摘要与 sessionID 双向确认。
+	if !containsString(env.tokens.deleted, bodyHash) {
+		t.Errorf("请求体令牌对应的会话必须被轮换，实际 deleted=%v", env.tokens.deleted)
+	}
+	if containsString(env.tokens.deleted, cookieHash) {
+		t.Errorf("请求体优先时不得轮换 Cookie 会话，实际 deleted=%v", env.tokens.deleted)
+	}
+	if !containsString(env.tokens.deletedSIDs, bodySession.SessionID) {
+		t.Errorf(
+			"轮换的 sessionID 必须来自请求体会话 %q，实际 %v",
+			bodySession.SessionID,
+			env.tokens.deletedSIDs,
+		)
+	}
+	if containsString(env.tokens.deletedSIDs, cookieSession.SessionID) {
+		t.Errorf(
+			"Cookie 会话 %q 不得被轮换，实际 %v",
+			cookieSession.SessionID,
+			env.tokens.deletedSIDs,
+		)
+	}
+	if _, ok := env.tokens.sessions[bodyHash]; ok {
+		t.Error("请求体令牌对应的旧会话必须已撤销")
+	}
+
+	// 响应体回传的新令牌必须对应本次轮换产生的新会话，而不是 Cookie 会话。
+	newSession, ok := env.tokens.sessions[newHash]
+	if !ok {
+		t.Fatalf("响应体 refreshToken 必须对应已写入的新会话，实际 sessions=%v", env.tokens.sessions)
+	}
+	if newSession.SessionID == cookieSession.SessionID {
+		t.Error("响应体新令牌不得复用 Cookie 会话的 sessionID")
+	}
+	stillCookie, ok := env.tokens.sessions[cookieHash]
+	if !ok {
+		t.Fatal("Cookie 中的旧会话必须保持原状（未被轮换）")
+	}
+	if stillCookie.SessionID != cookieSession.SessionID {
+		t.Errorf(
+			"Cookie 会话必须保持原 sessionID %q，实际 %q",
+			cookieSession.SessionID,
+			stillCookie.SessionID,
+		)
+	}
+	if newToken == cookieLogin.Tokens.RefreshToken {
+		t.Error("响应体不得回传 Cookie 通道的旧令牌")
+	}
+
+	// Cookie 会话必须仍可用于刷新：由 Cookie 通道再刷新一次，能成功即证明它未被消费。
+	w2 := env.request(
+		http.MethodPost,
+		"/api/v1/patient/auth/refresh",
+		"",
+		withRefreshCookie(cookieLogin.Tokens.RefreshToken),
+	)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("Cookie 会话二次刷新 status = %d, want 200; body=%s", w2.Code, w2.Body.String())
+	}
+	if !containsString(env.tokens.deleted, cookieHash) {
+		t.Errorf("Cookie 会话二次刷新时必须轮换它，实际 deleted=%v", env.tokens.deleted)
+	}
+	// 二次刷新必须换出另一枚令牌，证明它来自 Cookie 会话而不是首次的请求体会话。
+	if thirdToken := refreshResponseToken(t, decodeBody(t, w2)); thirdToken == newToken {
+		t.Error("Cookie 会话二次刷新必须轮换出新令牌，不得复用首次刷新的令牌")
+	}
+}
+
+// snapshotSessionHashes 复制桩里的 refresh 会话摘要集合，用于断言轮换前后的会话差异。
+func snapshotSessionHashes(env *patientAuthHandlerEnv) map[string]struct{} {
+	hashes := make(map[string]struct{}, len(env.tokens.sessions))
+	for hash := range env.tokens.sessions {
+		hashes[hash] = struct{}{}
+	}
+	return hashes
+}
+
+// assertDisabledRefreshForbidden 断言禁用账号刷新的公共语义：403 AUTH_FORBIDDEN、
+// 不下发任何 Set-Cookie；并且除被轮换掉的那条会话外，轮换前的会话必须逐条保持原状
+// （即没有写入新会话）。
+//
+// 服务层 Refresh 先 RotateRefreshSession 再校验 IsActive：403 分支下旧会话已被撤销、
+// 且不会再签发新令牌，这是期望行为（见 patientauth.Service.Refresh 的对应注释）。
+func assertDisabledRefreshForbidden(
+	t *testing.T,
+	env *patientAuthHandlerEnv,
+	w *httptest.ResponseRecorder,
+	before map[string]struct{},
+	rotatedRefreshToken string,
+) {
+	t.Helper()
+
+	body := assertErrorStatus(t, w, http.StatusForbidden, "AUTH_FORBIDDEN")
+	if body["message"] != "账号已被禁用" {
+		t.Errorf("message = %v，期望 账号已被禁用", body["message"])
+	}
+	if cookies := w.Result().Cookies(); len(cookies) != 0 {
+		t.Errorf("禁用账号不得下发 Cookie，实际 %v", cookies)
+	}
+
+	rotatedHash := authsession.HashRefreshToken(rotatedRefreshToken)
+	if !containsString(env.tokens.deleted, rotatedHash) {
+		t.Errorf("被轮换的旧会话必须已撤销，实际 deleted=%v", env.tokens.deleted)
+	}
+	if _, ok := env.tokens.sessions[rotatedHash]; ok {
+		t.Errorf("被轮换的旧会话不得继续存在，实际 sessions=%v", env.tokens.sessions)
+	}
+	for hash := range env.tokens.sessions {
+		if _, existed := before[hash]; !existed {
+			t.Errorf("禁用账号不得写入新会话，实际多出 %s", hash)
+		}
+	}
+	for hash := range before {
+		if hash == rotatedHash {
+			continue
+		}
+		if _, ok := env.tokens.sessions[hash]; !ok {
+			t.Errorf("未参与轮换的会话 %s 必须保持原状", hash)
+		}
+	}
+}
+
+// TestPatientRefreshDisabledAccountForbiddenWithBodyToken 覆盖「禁用账号 + 有效请求体令牌」：
+// 403 AUTH_FORBIDDEN，不下发 Cookie 也不写新会话（契约 §7.2、§10）。
+func TestPatientRefreshDisabledAccountForbiddenWithBodyToken(t *testing.T) {
+	env := newPatientAuthHandlerEnv(t)
+	login := env.login(t)
+	before := snapshotSessionHashes(env)
+	// 登录后禁用账号：此时 refresh 会话仍然有效，用于覆盖「禁用 + 有效 refresh token」组合。
+	env.repo.seedPatient(20, patient.StatusDisabled)
+
+	w := env.request(
+		http.MethodPost,
+		"/api/v1/patient/auth/refresh",
+		`{"refreshToken":"`+login.Tokens.RefreshToken+`"}`,
+		nil,
+	)
+	assertDisabledRefreshForbidden(t, env, w, before, login.Tokens.RefreshToken)
+}
+
+// TestPatientRefreshDisabledAccountForbiddenWithCookieToken 覆盖「禁用账号 + 有效 Cookie 令牌」：
+// 与请求体通道相同的 403 语义，Cookie 既不被覆盖也不被清理（契约 §7.2、§10）。
+func TestPatientRefreshDisabledAccountForbiddenWithCookieToken(t *testing.T) {
+	env := newPatientAuthHandlerEnv(t)
+	login := env.login(t)
+	before := snapshotSessionHashes(env)
+	env.repo.seedPatient(20, patient.StatusDisabled)
+
+	w := env.request(
+		http.MethodPost,
+		"/api/v1/patient/auth/refresh",
+		"",
+		withRefreshCookie(login.Tokens.RefreshToken),
+	)
+	assertDisabledRefreshForbidden(t, env, w, before, login.Tokens.RefreshToken)
+}
+
+// TestPatientRefreshDisabledAccountDoesNotFallBackToCookie 覆盖「禁用账号 + 两条通道都携带有效令牌」
+// （两个不同会话）：403 必须立即结束候选循环，Cookie 通道的会话不得被消费，
+// 否则禁用账号的刷新会把浏览器那条仍然有效的会话一并踢掉（契约 §7.2、§10）。
+func TestPatientRefreshDisabledAccountDoesNotFallBackToCookie(t *testing.T) {
+	env := newPatientAuthHandlerEnv(t)
+	cookieLogin := env.login(t) // 浏览器会话：Cookie 通道
+	bodyLogin := env.login(t)   // 小程序会话：请求体通道
+	before := snapshotSessionHashes(env)
+	env.repo.seedPatient(20, patient.StatusDisabled)
+
+	w := env.request(
+		http.MethodPost,
+		"/api/v1/patient/auth/refresh",
+		`{"refreshToken":"`+bodyLogin.Tokens.RefreshToken+`"}`,
+		withRefreshCookie(cookieLogin.Tokens.RefreshToken),
+	)
+
+	// 请求体优先：被轮换的只能是请求体那条会话，Cookie 会话必须原样保留。
+	assertDisabledRefreshForbidden(t, env, w, before, bodyLogin.Tokens.RefreshToken)
+	if env.tokens.getCalls != 1 {
+		t.Errorf("403 分支不得继续尝试下一条通道，实际读取会话 %d 次", env.tokens.getCalls)
+	}
+}
+
+// TestPatientRefreshTokenCandidatesSkipBlankAndPreferBody 直接覆盖候选收集规则（契约 §7.2）：
+// 请求体优先、Cookie 备用；空值与纯空白来源不得进入候选列表。
+// 服务层自身也会 TrimSpace 并短路，因此只有在这一层单测才能固定「空白请求体不产生候选」。
+func TestPatientRefreshTokenCandidatesSkipBlankAndPreferBody(t *testing.T) {
+	cases := []struct {
+		name   string
+		body   string
+		cookie string
+		want   string // 候选用 | 连接，便于同时比较顺序与取值
+	}{
+		{
+			name:   "请求体优先且两侧都去空白",
+			body:   "  body-token  ",
+			cookie: "cookie-token",
+			want:   "body-token|cookie-token",
+		},
+		{
+			name:   "纯空白请求体视为未携带",
+			body:   "   ",
+			cookie: "cookie-token",
+			want:   "cookie-token",
+		},
+		{
+			name:   "空请求体视为未携带",
+			body:   "",
+			cookie: "cookie-token",
+			want:   "cookie-token",
+		},
+		{
+			name:   "纯空白 Cookie 视为未携带",
+			body:   "body-token",
+			cookie: "   ",
+			want:   "body-token",
+		},
+		{
+			name:   "两条通道都为空时没有候选",
+			body:   " ",
+			cookie: "",
+			want:   "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(
+				http.MethodPost,
+				"/api/v1/patient/auth/refresh",
+				nil,
+			)
+			if tc.cookie != "" {
+				c.Request.AddCookie(&http.Cookie{
+					Name:  authsession.RefreshCookieName,
+					Value: tc.cookie,
+				})
+			}
+
+			got := refreshTokenCandidates(tc.body, c)
+			if joined := strings.Join(got, "|"); joined != tc.want {
+				t.Errorf("refreshTokenCandidates = %q，期望 %q", joined, tc.want)
+			}
 		})
 	}
 }
@@ -851,6 +1457,101 @@ func TestPatientLogoutWithValidTokenNoContentAndClearsCookies(t *testing.T) {
 		if cookie.Value != "" || cookie.MaxAge >= 0 {
 			t.Errorf("%s 应被清理（空值且 MaxAge<0），实际 %+v", name, cookie)
 		}
+	}
+}
+
+// TestPatientLogoutWithBodyRefreshTokenRevokesSession 覆盖小程序登出通道：
+// 请求头携带有效 access token、请求体携带 refresh token 时必须 204、清理 Cookie，
+// 且会话确实按请求体令牌的摘要撤销（getCalls 证明读了该令牌，而非只靠 claims.sid 兜底）
+// （契约 §7.2、§12.5）。
+func TestPatientLogoutWithBodyRefreshTokenRevokesSession(t *testing.T) {
+	env := newPatientAuthHandlerEnv(t)
+	login := env.login(t)
+	claims, err := env.service.ParseAccessToken(
+		login.Tokens.AccessToken,
+		domainauth.RealmPatient,
+	)
+	if err != nil {
+		t.Fatalf("解析患者 access token 失败：%v", err)
+	}
+
+	w := env.request(
+		http.MethodPost,
+		"/api/v1/patient/auth/logout",
+		`{"refreshToken":"`+login.Tokens.RefreshToken+`"}`,
+		func(req *http.Request) {
+			req.Header.Set("Authorization", "Bearer "+login.Tokens.AccessToken)
+		},
+	)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", w.Code, w.Body.String())
+	}
+	if w.Body.Len() != 0 {
+		t.Errorf("204 响应不得带响应体，实际 %s", w.Body.String())
+	}
+	if env.tokens.getCalls != 1 {
+		t.Errorf("必须按请求体令牌读取一次会话，实际 %d 次", env.tokens.getCalls)
+	}
+	refreshHash := authsession.HashRefreshToken(login.Tokens.RefreshToken)
+	if !containsString(env.tokens.deleted, refreshHash) {
+		t.Errorf("必须按请求体提交的 refresh token 撤销会话，实际 deleted=%v", env.tokens.deleted)
+	}
+	if _, ok := env.tokens.sessions[refreshHash]; ok {
+		t.Error("登出后 refresh 会话不得继续存在")
+	}
+	if !containsString(env.tokens.revoked, claims.ID) {
+		t.Errorf("必须撤销 access token 的 jti %q，实际 %v", claims.ID, env.tokens.revoked)
+	}
+	for _, name := range []string{
+		authsession.AccessCookieName,
+		authsession.RefreshCookieName,
+	} {
+		if cookie := setCookieByName(w, name); cookie == nil || cookie.Value != "" {
+			t.Errorf("登出必须清理 %s Cookie，实际 %+v", name, cookie)
+		}
+	}
+}
+
+// TestPatientLogoutWithInvalidBodyTokenStillNoContent 覆盖候选失配的登出：
+// 请求体 refresh token 无效、Cookie 有效时仍必须 204（登出幂等，不因候选失配失败），
+// 会话最终被撤销即可——由摘要还是 claims.sid 完成不作要求（契约 §7.2、§12.5）。
+func TestPatientLogoutWithInvalidBodyTokenStillNoContent(t *testing.T) {
+	env := newPatientAuthHandlerEnv(t)
+	login := env.login(t)
+	claims, err := env.service.ParseAccessToken(
+		login.Tokens.AccessToken,
+		domainauth.RealmPatient,
+	)
+	if err != nil {
+		t.Fatalf("解析患者 access token 失败：%v", err)
+	}
+
+	w := env.request(
+		http.MethodPost,
+		"/api/v1/patient/auth/logout",
+		`{"refreshToken":"unknown-refresh-token"}`,
+		func(req *http.Request) {
+			req.Header.Set("Authorization", "Bearer "+login.Tokens.AccessToken)
+			req.AddCookie(&http.Cookie{
+				Name:  authsession.RefreshCookieName,
+				Value: login.Tokens.RefreshToken,
+			})
+		},
+	)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", w.Code, w.Body.String())
+	}
+	if w.Body.Len() != 0 {
+		t.Errorf("204 响应不得带响应体，实际 %s", w.Body.String())
+	}
+	refreshHash := authsession.HashRefreshToken(login.Tokens.RefreshToken)
+	if _, ok := env.tokens.sessions[refreshHash]; ok {
+		t.Error("登出后 refresh 会话不得继续存在")
+	}
+	if !containsString(env.tokens.revoked, claims.ID) {
+		t.Errorf("必须撤销 access token 的 jti %q，实际 %v", claims.ID, env.tokens.revoked)
 	}
 }
 
