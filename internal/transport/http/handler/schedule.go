@@ -38,10 +38,14 @@ type errorEnvelope struct {
 }
 
 // opResult 是单个写操作产生的 HTTP 结果：status + 自定义头 + 响应体。
+//
+// body 以 any 承载：排班域使用 map[string]any 组装资源与错误 envelope，
+// 挂号域直接放入 response 包的响应 DTO；两者都由 marshalBody 序列化，
+// 保证「首次响应」与「幂等重放」使用同一份字节。
 type opResult struct {
 	status  int
 	headers map[string]string
-	body    map[string]any
+	body    any
 }
 
 // ListPlans 处理 GET /api/v1/schedule/plans。
@@ -260,9 +264,15 @@ func serviceStatus(code string) int {
 }
 
 // marshalBody 把响应对象序列化为 JSON 字节（空对象不会出现，调用方仅在无 body 时传 nil）。
-func marshalBody(body map[string]any) []byte {
-	if len(body) == 0 {
+func marshalBody(body any) []byte {
+	switch value := body.(type) {
+	case nil:
 		return nil
+	case map[string]any:
+		// 空 map 等价于「无响应体」（例如 204 的 DELETE）。
+		if len(value) == 0 {
+			return nil
+		}
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {

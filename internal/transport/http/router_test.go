@@ -53,6 +53,7 @@ func newContractTestRouter(t *testing.T) *gin.Engine {
 		nil, // idempotencyStore
 		nil, // patientRepository
 		nil, // wechatAuthenticator
+		nil, // registrationRepository
 	)
 }
 
@@ -71,6 +72,7 @@ func newContractTestRouterWithAccessToken(t *testing.T) (*gin.Engine, string) {
 		nil, // idempotencyStore
 		nil, // patientRepository
 		nil, // wechatAuthenticator
+		nil, // registrationRepository
 	)
 
 	claims := &userservice.AccessClaims{

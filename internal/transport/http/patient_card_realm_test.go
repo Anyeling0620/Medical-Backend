@@ -167,6 +167,7 @@ func newPatientCardRealmTestRouter(
 		nil, // idempotencyStore
 		repo,
 		nil, // wechatAuthenticator
+		nil, // registrationRepository
 	)
 
 	claims := &userservice.AccessClaims{
