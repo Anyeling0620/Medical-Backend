@@ -55,7 +55,8 @@ type ScheduleSlotRepository interface {
 	// 避免先查存在再查列表的并发删除窗口返回 200 []）。
 	ListSlotsByPlan(ctx context.Context, planID int64) ([]schedule.ScheduleSlot, error)
 	// CreateSlot 事务内创建时段：计划不存在返回 ErrPlanNotFound；
-	// 同计划时段重复返回 ErrSlotExists；计划已开始返回 ErrSlotLocked。
+	// 同计划时段重复返回 ErrSlotExists；计划已开始返回 ErrSlotLocked；
+	// 计划所属医生已离职/退休等非在诊状态返回 ErrDoctorInactive（不得出诊）。
 	CreateSlot(ctx context.Context, slot schedule.ScheduleSlot, now time.Time) (*schedule.ScheduleSlot, error)
 	// UpdateSlotMaximum 事务内更新 maximum：
 	// 时段不存在返回 ErrSlotNotFound；计划已开始或已有挂号返回 ErrSlotLocked；

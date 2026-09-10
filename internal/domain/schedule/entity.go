@@ -28,6 +28,9 @@ var (
 	ErrSlotNotFound = errors.New("schedule slot not found")
 	// ErrSlotExists 表示同一计划下时段编号重复（409 SCHEDULE_SLOT_EXISTS）。
 	ErrSlotExists = errors.New("schedule slot already exists")
+	// ErrDoctorInactive 表示排班所属医生已离职/退休或处于其他非在诊状态，
+	// 不具备出诊资格，不得为其新增出诊时段（422 REQUEST_VALIDATION_FAILED）。
+	ErrDoctorInactive = errors.New("schedule doctor is not active")
 )
 
 // PlanFilter 是排班计划列表的查询条件与排序参数。
