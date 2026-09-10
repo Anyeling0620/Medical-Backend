@@ -24,21 +24,29 @@ import (
 type PatientAuthHandler struct {
 	service *patientauthservice.Service
 	secure  bool
+	// allowOpenIDLogin 为 true（APP_ENV=development）时才放行请求体里的 openid 直通登录：
+	// openid 无法自证身份，其余环境必须只能走微信 code 换取。
+	allowOpenIDLogin bool
 }
 
 func NewPatientAuthHandler(
 	service *patientauthservice.Service,
 	secure bool,
+	allowOpenIDLogin bool,
 ) *PatientAuthHandler {
 	return &PatientAuthHandler{
-		service: service,
-		secure:  secure,
+		service:          service,
+		secure:           secure,
+		allowOpenIDLogin: allowOpenIDLogin,
 	}
 }
 
 // WeChatLogin 处理 POST /api/v1/patient/auth/wechat-login：登录与注册合一。
 // 成功响应用 isNewUser 区分本次是否为新注册；refresh token 同时经 HttpOnly Cookie
 // （浏览器通道）与响应体（小程序通道，wx.request 不携带 Cookie）下发。
+//
+// 请求体提交 code 走微信换取，任何环境可用；提交 openid 属于测试阶段直通，
+// 只在 APP_ENV=development 放行（契约 §7.1）。两者同时提交时以 code 为准。
 func (h *PatientAuthHandler) WeChatLogin(c *gin.Context) {
 	var req request.WeChatLoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -46,8 +54,10 @@ func (h *PatientAuthHandler) WeChatLogin(c *gin.Context) {
 		return
 	}
 
-	// 纯空白 code 等同于未提交，与绑定失败的文案保持一致（契约 §12.5）。
-	if strings.TrimSpace(req.Code) == "" {
+	// 纯空白 code/openid 等同于未提交，与绑定失败的文案保持一致（契约 §12.5）。
+	code := strings.TrimSpace(req.Code)
+	openID := strings.TrimSpace(req.OpenID)
+	if code == "" && openID == "" {
 		h.writeError(
 			c,
 			http.StatusUnprocessableEntity,
@@ -57,7 +67,25 @@ func (h *PatientAuthHandler) WeChatLogin(c *gin.Context) {
 		return
 	}
 
-	result, err := h.service.WeChatLogin(c.Request.Context(), req.Code)
+	var (
+		result *patientauthservice.LoginResult
+		err    error
+	)
+	switch {
+	case code != "":
+		result, err = h.service.WeChatLogin(c.Request.Context(), code)
+	case !h.allowOpenIDLogin:
+		// 非测试环境显式拒绝：否则任何人都能提交他人 openid 冒充其登录。
+		h.writeError(
+			c,
+			http.StatusUnprocessableEntity,
+			"REQUEST_VALIDATION_FAILED",
+			"当前环境不支持使用 openid 登录",
+		)
+		return
+	default:
+		result, err = h.service.LoginByOpenID(c.Request.Context(), openID)
+	}
 	if err != nil {
 		h.loginError(c, err)
 		return
@@ -316,6 +344,13 @@ func (h *PatientAuthHandler) loginError(c *gin.Context, err error) {
 			http.StatusUnprocessableEntity,
 			"REQUEST_VALIDATION_FAILED",
 			"微信登录 code 无效或已过期",
+		)
+	case errors.Is(err, patientauthservice.ErrInvalidOpenID):
+		h.writeError(
+			c,
+			http.StatusUnprocessableEntity,
+			"REQUEST_VALIDATION_FAILED",
+			"微信登录 openid 无效",
 		)
 	case errors.Is(err, patientauthservice.ErrPatientDisabled):
 		h.writeError(c, http.StatusForbidden, "AUTH_FORBIDDEN", "账号已被禁用")

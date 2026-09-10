@@ -1209,3 +1209,203 @@ func TestWeChatLoginCodeLengthCountsRunes(t *testing.T) {
 		}
 	})
 }
+
+// --- openid 直通登录（仅测试阶段，APP_ENV=development）---
+
+// TestLoginByOpenIDRejectsInvalidOpenID 覆盖直通登录的形状校验：
+// 空串、纯空白与超过 128 字符一律返回 ErrInvalidOpenID，
+// 且不得调用微信适配器、不得建号、不得写入 refresh 会话。
+func TestLoginByOpenIDRejectsInvalidOpenID(t *testing.T) {
+	cases := []struct {
+		name   string
+		openID string
+	}{
+		{name: "空 openid", openID: ""},
+		{name: "仅空白 openid", openID: "   "},
+		{name: "129 个 ASCII 字符", openID: strings.Repeat("a", 129)},
+		{name: "129 个多字节字符", openID: strings.Repeat("汉", 129)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newPatientAuthTestEnv(t)
+
+			_, err := env.service.LoginByOpenID(context.Background(), tc.openID)
+			if !errors.Is(err, ErrInvalidOpenID) {
+				t.Fatalf("err = %v，期望 ErrInvalidOpenID", err)
+			}
+			if len(env.wechat.calls) != 0 {
+				t.Errorf("直通登录不得调用微信 code2Session，实际调用 %v", env.wechat.calls)
+			}
+			if len(env.repo.patients) != 0 {
+				t.Errorf("openid 非法不得建号，实际 %d 个账号", len(env.repo.patients))
+			}
+			if len(env.tokens.saved) != 0 {
+				t.Error("openid 非法不得写入 refresh 会话")
+			}
+		})
+	}
+}
+
+// TestLoginByOpenIDAcceptsMaxLengthOpenID 覆盖上限 128 个多字节字符（字节数 384）合法：
+// 与 code 的长度口径保持一致，openid 原样作为账号标识落库。
+func TestLoginByOpenIDAcceptsMaxLengthOpenID(t *testing.T) {
+	env := newPatientAuthTestEnv(t)
+	openID := strings.Repeat("汉", 128)
+
+	result, err := env.service.LoginByOpenID(context.Background(), openID)
+	if err != nil {
+		t.Fatalf("128 字符（Unicode）openid 应通过校验，实际 err=%v", err)
+	}
+	if result.Patient == nil || result.Patient.OpenID != openID {
+		t.Fatalf("患者主体 = %+v，期望 openid 原样透传", result.Patient)
+	}
+	if len(env.wechat.calls) != 0 {
+		t.Errorf("直通登录不得调用微信 code2Session，实际调用 %v", env.wechat.calls)
+	}
+}
+
+// TestLoginByOpenIDCreatesPatientAndIssuesTokens 覆盖合法直通登录：
+// 全程不调用微信，直接按 openid 建号（首次 isNewUser=true、再次为 false），
+// 并签发 realm=patient 的 access token 与 refresh 会话（契约 §7.1）。
+func TestLoginByOpenIDCreatesPatientAndIssuesTokens(t *testing.T) {
+	env := newPatientAuthTestEnv(t)
+	const openID = "openid-direct-unit-test"
+
+	result, err := env.service.LoginByOpenID(context.Background(), openID)
+	if err != nil {
+		t.Fatalf("直通登录应成功，实际 err=%v", err)
+	}
+	if len(env.wechat.calls) != 0 {
+		t.Errorf("直通登录不得调用微信 code2Session，实际调用 %v", env.wechat.calls)
+	}
+	if !result.IsNewUser {
+		t.Error("首次直通登录 isNewUser 应为 true")
+	}
+	if result.Patient == nil || result.Patient.ID != 20 ||
+		result.Patient.OpenID != openID {
+		t.Fatalf("患者主体 = %+v，期望 ID=20 且 openid=%q", result.Patient, openID)
+	}
+	if result.Tokens.AccessToken == "" || result.Tokens.RefreshToken == "" {
+		t.Error("直通登录必须同时下发 access token 与 refresh token")
+	}
+
+	claims, err := env.service.ParseAccessToken(
+		result.Tokens.AccessToken,
+		domainauth.RealmPatient,
+	)
+	if err != nil {
+		t.Fatalf("患者 access token 应可解析，实际 err=%v", err)
+	}
+	if claims.Realm != domainauth.RealmPatient {
+		t.Errorf("access token realm = %q，期望 patient", claims.Realm)
+	}
+	if claims.UserID != result.Patient.ID {
+		t.Errorf("access token userId = %d，期望 %d", claims.UserID, result.Patient.ID)
+	}
+
+	if len(env.tokens.saved) != 1 {
+		t.Fatalf("refresh 会话写入次数 = %d，期望 1", len(env.tokens.saved))
+	}
+	saved := env.tokens.saved[0]
+	if saved.Realm != domainauth.RealmPatient {
+		t.Errorf("refresh 会话 realm = %q，期望 patient", saved.Realm)
+	}
+	if saved.UserID != result.Patient.ID {
+		t.Errorf("refresh 会话 userId = %d，期望 %d", saved.UserID, result.Patient.ID)
+	}
+	if saved.TokenHash != authsession.HashRefreshToken(result.Tokens.RefreshToken) {
+		t.Error("refresh 会话摘要必须对应本次下发的 refresh token")
+	}
+
+	// 同一 openid 再次直通登录必须命中同一账号，不得重复建号。
+	again, err := env.service.LoginByOpenID(context.Background(), openID)
+	if err != nil {
+		t.Fatalf("同一 openid 再次登录应成功，实际 err=%v", err)
+	}
+	if again.IsNewUser {
+		t.Error("已存在账号再次直通登录 isNewUser 应为 false")
+	}
+	if again.Patient == nil || again.Patient.ID != result.Patient.ID {
+		t.Errorf("患者主体 = %+v，期望复用 ID=%d", again.Patient, result.Patient.ID)
+	}
+	if len(env.repo.patients) != 1 {
+		t.Errorf("账号数量 = %d，期望 1", len(env.repo.patients))
+	}
+}
+
+// TestLoginByOpenIDTrimsSurroundingWhitespace 覆盖两侧空白被裁剪后再落库：
+// 带空白的输入必须与不带空白的输入命中同一账号。
+func TestLoginByOpenIDTrimsSurroundingWhitespace(t *testing.T) {
+	env := newPatientAuthTestEnv(t)
+
+	result, err := env.service.LoginByOpenID(context.Background(), "  openid-trimmed  ")
+	if err != nil {
+		t.Fatalf("直通登录应成功，实际 err=%v", err)
+	}
+	if result.Patient == nil || result.Patient.OpenID != "openid-trimmed" {
+		t.Fatalf("患者主体 = %+v，期望裁剪空白后的 openid", result.Patient)
+	}
+
+	again, err := env.service.LoginByOpenID(context.Background(), "openid-trimmed")
+	if err != nil {
+		t.Fatalf("再次直通登录应成功，实际 err=%v", err)
+	}
+	if again.IsNewUser || again.Patient.ID != result.Patient.ID {
+		t.Errorf(
+			"裁剪后应命中同一账号，实际 isNewUser=%v 主体=%+v",
+			again.IsNewUser,
+			again.Patient,
+		)
+	}
+}
+
+// TestLoginByOpenIDDisabledPatientIssuesNothing 覆盖禁用账号直通登录：
+// 返回 ErrPatientDisabled（handler → 403 AUTH_FORBIDDEN），不得签发任何令牌。
+func TestLoginByOpenIDDisabledPatientIssuesNothing(t *testing.T) {
+	env := newPatientAuthTestEnv(t)
+	env.repo.seedPatient(20, patient.StatusDisabled)
+
+	_, err := env.service.LoginByOpenID(context.Background(), patientAuthTestOpenID)
+	if !errors.Is(err, ErrPatientDisabled) {
+		t.Fatalf("err = %v，期望 ErrPatientDisabled", err)
+	}
+	if len(env.tokens.saved) != 0 {
+		t.Errorf("禁用账号不得写入 refresh 会话，实际 %+v", env.tokens.saved)
+	}
+}
+
+// TestLoginByOpenIDRepositoryFailureIsDependencyUnavailable 覆盖仓储故障：
+// 必须归为 ErrDependencyUnavailable（handler → 502 DEPENDENCY_UNAVAILABLE）并保留根因。
+func TestLoginByOpenIDRepositoryFailureIsDependencyUnavailable(t *testing.T) {
+	env := newPatientAuthTestEnv(t)
+	cause := errors.New("postgres unavailable")
+	env.repo.findOrCreateErr = cause
+
+	_, err := env.service.LoginByOpenID(context.Background(), "openid-direct-dep")
+	if !errors.Is(err, ErrDependencyUnavailable) {
+		t.Fatalf("err = %v，期望 ErrDependencyUnavailable", err)
+	}
+	if !errors.Is(err, cause) {
+		t.Errorf("依赖故障必须保留根因，err = %v", err)
+	}
+}
+
+// TestLoginByOpenIDWithoutDependenciesReturnsInternalError 覆盖依赖缺失：
+// 未配置仓储与令牌依赖时直通登录必须返回内部错误（handler → 500 INTERNAL_SERVER_ERROR），
+// 不得归类为 openid 无效，也不得 panic。
+func TestLoginByOpenIDWithoutDependenciesReturnsInternalError(t *testing.T) {
+	service := NewService(nil, nil, nil, Config{
+		JWTSecret:  patientAuthTestSecret,
+		AccessTTL:  15 * time.Minute,
+		RefreshTTL: 24 * time.Hour,
+	})
+
+	_, err := service.LoginByOpenID(context.Background(), "openid-direct-no-deps")
+	if err == nil {
+		t.Fatal("依赖缺失时直通登录必须返回错误")
+	}
+	if errors.Is(err, ErrInvalidOpenID) || errors.Is(err, ErrDependencyUnavailable) {
+		t.Errorf("依赖缺失应归为内部错误，实际 %v", err)
+	}
+}

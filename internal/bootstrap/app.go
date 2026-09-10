@@ -35,6 +35,12 @@ func NewApp(cfg config.Config) (*App, error) {
 	if cfg.App.Env == "production" {
 		gin.SetMode(gin.ReleaseMode)
 	}
+	// APP_ENV 的缺省值就是 development（含变量为空串的情形），而 development 会放行
+	// 「直接提交 openid 登录」（见 internal/transport/http/router.go）：
+	// 启动时显式提示，避免非本地环境漏配 APP_ENV 时被静默启用。
+	if cfg.App.Env == "development" {
+		log.Printf("警告：APP_ENV=development，患者登录允许直接提交 openid，仅供本地与测试环境使用")
+	}
 	connectedClients, dependencies := connectDependencies(cfg)
 	for name, dependency := range dependencies {
 		if dependency.Connected {

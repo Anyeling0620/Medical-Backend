@@ -75,6 +75,9 @@ func NewRouter(
 	patientAuthHandler := handler.NewPatientAuthHandler(
 		patientService,
 		cfg.Auth.CookieSecure,
+		// openid 直通登录（跳过微信 code2Session）只是测试阶段的便利通道：
+		// 只有 APP_ENV=development 才放行，其余环境一律只能走 code 换取（契约 §7.1）。
+		cfg.App.Env == "development",
 	)
 	patientAuthRoutes := router.Group("/api/v1/patient/auth")
 	patientAuthRoutes.POST("/wechat-login", patientAuthHandler.WeChatLogin)

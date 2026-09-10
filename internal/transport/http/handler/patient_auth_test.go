@@ -8,6 +8,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -255,12 +256,15 @@ func (r *patientAuthHandlerPatientRepo) seedCard(patientID int64, tel string) *p
 type patientAuthHandlerWeChat struct {
 	openID string
 	err    error
+	// calls 记录 code2Session 收到的 code：openid 直通登录必须保持零调用。
+	calls []string
 }
 
 func (w *patientAuthHandlerWeChat) Code2Session(
 	_ context.Context,
-	_ string,
+	code string,
 ) (string, error) {
+	w.calls = append(w.calls, code)
 	return w.openID, w.err
 }
 
@@ -273,9 +277,19 @@ type patientAuthHandlerEnv struct {
 	wechat  *patientAuthHandlerWeChat
 }
 
-// newPatientAuthHandlerEnv 构造与 router.go 一致的患者端认证路由：
+// newPatientAuthHandlerEnv 构造与 router.go 一致的患者端认证路由（默认非测试环境）：
 // auth 三个接口自带凭据校验，只有 /patient/me 经过 realm=patient 的令牌中间件。
 func newPatientAuthHandlerEnv(t *testing.T) *patientAuthHandlerEnv {
+	t.Helper()
+	return newPatientAuthHandlerEnvWithOpenIDLogin(t, false)
+}
+
+// newPatientAuthHandlerEnvWithOpenIDLogin 与 newPatientAuthHandlerEnv 同构，
+// 只多了 openid 直通开关（对应 router.go 里 cfg.App.Env == "development" 的判定结果）。
+func newPatientAuthHandlerEnvWithOpenIDLogin(
+	t *testing.T,
+	allowOpenIDLogin bool,
+) *patientAuthHandlerEnv {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 
@@ -294,7 +308,8 @@ func newPatientAuthHandlerEnv(t *testing.T) *patientAuthHandlerEnv {
 		},
 	)
 
-	h := NewPatientAuthHandler(service, false)
+	// 由调用方决定是否放行 openid 直通登录：非 development 环境恒为 false。
+	h := NewPatientAuthHandler(service, false, allowOpenIDLogin)
 	router := gin.New()
 	router.POST("/api/v1/patient/auth/wechat-login", h.WeChatLogin)
 	router.POST("/api/v1/patient/auth/refresh", h.Refresh)
@@ -700,6 +715,344 @@ func TestPatientWeChatLoginWeChatCodeInvalidUnprocessable(t *testing.T) {
 	)
 
 	assertErrorStatus(t, w, http.StatusUnprocessableEntity, "REQUEST_VALIDATION_FAILED")
+}
+
+// --- openid 直通登录（仅测试阶段，APP_ENV=development）---
+
+// TestPatientWeChatLoginWithOpenIDInDevelopment 覆盖测试阶段直通登录：
+// allowOpenIDLogin=true（APP_ENV=development）时只提交 openid 即可成功登录，
+// 全程不调用微信 code2Session，并按该 openid 建号（契约 §7.1）。
+func TestPatientWeChatLoginWithOpenIDInDevelopment(t *testing.T) {
+	env := newPatientAuthHandlerEnvWithOpenIDLogin(t, true)
+	const openID = "openid-handler-direct"
+	body := `{"openid":"` + openID + `"}`
+
+	w := env.request(
+		http.MethodPost,
+		"/api/v1/patient/auth/wechat-login",
+		body,
+		nil,
+	)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if len(env.wechat.calls) != 0 {
+		t.Errorf("openid 直通不得调用微信 code2Session，实际 %v", env.wechat.calls)
+	}
+
+	resp := decodeBody(t, w)
+	if resp["isNewUser"] != true {
+		t.Errorf("isNewUser = %v，期望 true", resp["isNewUser"])
+	}
+	summary, ok := resp["patient"].(map[string]any)
+	if !ok {
+		t.Fatalf("patient = %v，期望对象", resp["patient"])
+	}
+	if id, ok := summary["id"].(float64); !ok || id != 20 {
+		t.Errorf("patient.id = %v，期望 20", summary["id"])
+	}
+	if _, exists := summary["openId"]; exists {
+		t.Error("患者摘要不得包含 openId")
+	}
+	if token, ok := resp["accessToken"].(string); !ok || token == "" {
+		t.Errorf("accessToken = %v，期望非空字符串", resp["accessToken"])
+	}
+	parsePatientExpiresAt(t, resp["accessExpiresAt"])
+	if cardID, exists := resp["cardId"]; !exists || cardID != nil {
+		t.Errorf("cardId = %v，期望 null", resp["cardId"])
+	}
+
+	// 必须按请求体提交的 openid 建号，而不是微信桩的默认 openid。
+	profile := env.repo.patients[20]
+	if profile == nil || profile.OpenID != openID {
+		t.Fatalf("账号 = %+v，期望 openid=%q", profile, openID)
+	}
+
+	// refresh 通道与 code 登录保持一致：Cookie 与响应体是同一个已落库的令牌。
+	refreshCookie := setCookieByName(w, authsession.RefreshCookieName)
+	if refreshCookie == nil || refreshCookie.Value == "" {
+		t.Fatalf(
+			"直通登录必须下发 refresh Cookie，实际 %v",
+			w.Header().Values("Set-Cookie"),
+		)
+	}
+	bodyToken := refreshResponseToken(t, resp)
+	if bodyToken != refreshCookie.Value {
+		t.Errorf(
+			"响应体 refreshToken = %q，期望等于 refresh Cookie 的值 %q",
+			bodyToken,
+			refreshCookie.Value,
+		)
+	}
+	if _, exists := env.tokens.sessions[authsession.HashRefreshToken(bodyToken)]; !exists {
+		t.Error("响应体回传的 refresh token 必须对应已写入的刷新会话")
+	}
+
+	// 同一 openid 再次直通登录必须命中同一账号。
+	again := env.request(
+		http.MethodPost,
+		"/api/v1/patient/auth/wechat-login",
+		body,
+		nil,
+	)
+	if again.Code != http.StatusOK {
+		t.Fatalf(
+			"再次登录 status = %d, want 200; body=%s",
+			again.Code,
+			again.Body.String(),
+		)
+	}
+	if againBody := decodeBody(t, again); againBody["isNewUser"] != false {
+		t.Errorf("已存在账号 isNewUser = %v，期望 false", againBody["isNewUser"])
+	}
+	if len(env.repo.patients) != 1 {
+		t.Errorf("账号数量 = %d，期望 1", len(env.repo.patients))
+	}
+}
+
+// TestPatientWeChatLoginWhitespaceCodeFallsBackToOpenID 覆盖 code 为纯空白时按未提交处理：
+// development 下「纯空白 code + 合法 openid」仍必须走 openid 直通，
+// 而不是报「微信登录 code 不能为空」。
+func TestPatientWeChatLoginWhitespaceCodeFallsBackToOpenID(t *testing.T) {
+	env := newPatientAuthHandlerEnvWithOpenIDLogin(t, true)
+
+	w := env.request(
+		http.MethodPost,
+		"/api/v1/patient/auth/wechat-login",
+		`{"code":"   ","openid":"openid-handler-blank-code"}`,
+		nil,
+	)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if len(env.wechat.calls) != 0 {
+		t.Errorf("纯空白 code 不得调用微信 code2Session，实际 %v", env.wechat.calls)
+	}
+	profile := env.repo.patients[20]
+	if profile == nil || profile.OpenID != "openid-handler-blank-code" {
+		t.Fatalf("账号 = %+v，期望按 openid 直通建号", profile)
+	}
+}
+
+// TestPatientWeChatLoginOpenIDRejectedOutsideDevelopment 覆盖非测试环境
+// （allowOpenIDLogin=false）提交 openid：422 REQUEST_VALIDATION_FAILED，
+// 且不得建号、不得调用微信、不得下发 Cookie。
+func TestPatientWeChatLoginOpenIDRejectedOutsideDevelopment(t *testing.T) {
+	env := newPatientAuthHandlerEnv(t)
+
+	w := env.request(
+		http.MethodPost,
+		"/api/v1/patient/auth/wechat-login",
+		`{"openid":"openid-not-allowed"}`,
+		nil,
+	)
+	resp := assertErrorStatus(
+		t,
+		w,
+		http.StatusUnprocessableEntity,
+		"REQUEST_VALIDATION_FAILED",
+	)
+	if resp["message"] != "当前环境不支持使用 openid 登录" {
+		t.Errorf(
+			"message = %v，期望 %q",
+			resp["message"],
+			"当前环境不支持使用 openid 登录",
+		)
+	}
+	if len(env.repo.patients) != 0 {
+		t.Errorf("非测试环境不得按 openid 建号，实际 %d 个账号", len(env.repo.patients))
+	}
+	if len(env.tokens.sessions) != 0 {
+		t.Error("非测试环境不得写入 refresh 会话")
+	}
+	if len(env.wechat.calls) != 0 {
+		t.Errorf("非测试环境不得调用微信 code2Session，实际 %v", env.wechat.calls)
+	}
+	if cookies := w.Result().Cookies(); len(cookies) != 0 {
+		t.Errorf("拒绝 openid 登录时不得下发 Cookie，实际 %v", cookies)
+	}
+}
+
+// TestPatientWeChatLoginBlankCredentialsUnprocessable 覆盖 code 与 openid 都未提交（含纯空白）：
+// 无论是否放行 openid 直通，都按「凭据缺失」返回 422，
+// 文案与 code 缺失保持一致（契约 §12.5）。
+func TestPatientWeChatLoginBlankCredentialsUnprocessable(t *testing.T) {
+	bodies := []string{
+		`{}`,
+		`{"code":""}`,
+		`{"code":"   "}`,
+		`{"openid":""}`,
+		`{"openid":"   "}`,
+		`{"code":"","openid":""}`,
+		`{"code":"   ","openid":"   "}`,
+	}
+
+	for _, allowOpenIDLogin := range []bool{false, true} {
+		for _, body := range bodies {
+			t.Run(
+				fmt.Sprintf("allowOpenIDLogin=%v/%s", allowOpenIDLogin, body),
+				func(t *testing.T) {
+					env := newPatientAuthHandlerEnvWithOpenIDLogin(
+						t,
+						allowOpenIDLogin,
+					)
+
+					w := env.request(
+						http.MethodPost,
+						"/api/v1/patient/auth/wechat-login",
+						body,
+						nil,
+					)
+					resp := assertErrorStatus(
+						t,
+						w,
+						http.StatusUnprocessableEntity,
+						"REQUEST_VALIDATION_FAILED",
+					)
+					if resp["message"] != "微信登录 code 不能为空" {
+						t.Errorf(
+							"message = %v，期望 %q",
+							resp["message"],
+							"微信登录 code 不能为空",
+						)
+					}
+					if len(env.repo.patients) != 0 {
+						t.Error("凭据缺失不得建号")
+					}
+					if len(env.tokens.sessions) != 0 {
+						t.Error("凭据缺失不得写入 refresh 会话")
+					}
+					if len(env.wechat.calls) != 0 {
+						t.Errorf(
+							"凭据缺失不得调用微信 code2Session，实际 %v",
+							env.wechat.calls,
+						)
+					}
+					if cookies := w.Result().Cookies(); len(cookies) != 0 {
+						t.Errorf("凭据缺失不得下发 Cookie，实际 %v", cookies)
+					}
+				},
+			)
+		}
+	}
+}
+
+// TestPatientWeChatLoginInvalidOpenIDUnprocessable 覆盖 openid 形状校验失败：
+// development 下超过 128 字符由 use case 拒绝，handler 映射 422「微信登录 openid 无效」；
+// 非 development 下环境开关先行拦截，仍返回 422「当前环境不支持使用 openid 登录」。
+func TestPatientWeChatLoginInvalidOpenIDUnprocessable(t *testing.T) {
+	cases := []struct {
+		name             string
+		allowOpenIDLogin bool
+		message          string
+	}{
+		{
+			name:             "development 下超长 openid",
+			allowOpenIDLogin: true,
+			message:          "微信登录 openid 无效",
+		},
+		{
+			name:             "非 development 下超长 openid 先被环境拦截",
+			allowOpenIDLogin: false,
+			message:          "当前环境不支持使用 openid 登录",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newPatientAuthHandlerEnvWithOpenIDLogin(t, tc.allowOpenIDLogin)
+
+			w := env.request(
+				http.MethodPost,
+				"/api/v1/patient/auth/wechat-login",
+				`{"openid":"`+strings.Repeat("a", 129)+`"}`,
+				nil,
+			)
+			resp := assertErrorStatus(
+				t,
+				w,
+				http.StatusUnprocessableEntity,
+				"REQUEST_VALIDATION_FAILED",
+			)
+			if resp["message"] != tc.message {
+				t.Errorf("message = %v，期望 %q", resp["message"], tc.message)
+			}
+			if len(env.repo.patients) != 0 {
+				t.Error("openid 非法不得建号")
+			}
+			if len(env.wechat.calls) != 0 {
+				t.Errorf("openid 非法不得调用微信 code2Session，实际 %v", env.wechat.calls)
+			}
+			if cookies := w.Result().Cookies(); len(cookies) != 0 {
+				t.Errorf("校验失败不得下发 Cookie，实际 %v", cookies)
+			}
+		})
+	}
+}
+
+// TestPatientWeChatLoginPrefersCodeOverOpenID 覆盖同时提交 code 与 openid：
+// 一律以 code 为准、openid 完全忽略；openid 是否合法与是否放行直通都不影响结果。
+func TestPatientWeChatLoginPrefersCodeOverOpenID(t *testing.T) {
+	cases := []struct {
+		name   string
+		openID string
+	}{
+		{name: "openid 合法", openID: "openid-must-be-ignored"},
+		{name: "openid 超长", openID: strings.Repeat("a", 129)},
+	}
+
+	for _, allowOpenIDLogin := range []bool{false, true} {
+		for _, tc := range cases {
+			t.Run(
+				fmt.Sprintf("allowOpenIDLogin=%v/%s", allowOpenIDLogin, tc.name),
+				func(t *testing.T) {
+					env := newPatientAuthHandlerEnvWithOpenIDLogin(
+						t,
+						allowOpenIDLogin,
+					)
+
+					w := env.request(
+						http.MethodPost,
+						"/api/v1/patient/auth/wechat-login",
+						`{"code":"wx_code_abc123","openid":"`+tc.openID+`"}`,
+						nil,
+					)
+					if w.Code != http.StatusOK {
+						t.Fatalf(
+							"status = %d, want 200; body=%s",
+							w.Code,
+							w.Body.String(),
+						)
+					}
+					if len(env.wechat.calls) != 1 ||
+						env.wechat.calls[0] != "wx_code_abc123" {
+						t.Errorf(
+							"有 code 时必须走微信换取，实际调用 %v",
+							env.wechat.calls,
+						)
+					}
+					if resp := decodeBody(t, w); resp["isNewUser"] != true {
+						t.Errorf("isNewUser = %v，期望 true", resp["isNewUser"])
+					}
+					// 账号必须落在微信桩返回的 openid 上，而不是请求体里的值。
+					profile := env.repo.patients[20]
+					if profile == nil || profile.OpenID != patientAuthHandlerOpenID {
+						t.Fatalf(
+							"账号 = %+v，期望微信桩返回的 openid %q",
+							profile,
+							patientAuthHandlerOpenID,
+						)
+					}
+					if len(env.repo.patients) != 1 {
+						t.Errorf(
+							"不得按请求体 openid 建号，实际 %d 个账号",
+							len(env.repo.patients),
+						)
+					}
+				},
+			)
+		}
+	}
 }
 
 // --- POST /api/v1/patient/auth/refresh ---

@@ -21,6 +21,7 @@ import (
 )
 
 // 微信登录 code 的长度约束（spec/04-api-contract.md §7.1：1-128 字符）。
+// 测试阶段的 openid 直通登录复用同一区间，见 LoginByOpenID。
 const (
 	minLoginCodeLength = 1
 	maxLoginCodeLength = 128
@@ -30,6 +31,9 @@ var (
 	// ErrInvalidCode 表示微信登录 code 缺失、超长，或微信判定其无效/已被使用。
 	// 映射为 422 REQUEST_VALIDATION_FAILED。
 	ErrInvalidCode = errors.New("wechat login code is invalid")
+	// ErrInvalidOpenID 表示测试阶段直通登录提交的 openid 为空或超出 1-128 字符，
+	// 映射为 422 REQUEST_VALIDATION_FAILED。
+	ErrInvalidOpenID = errors.New("wechat login openid is invalid")
 	// ErrPatientDisabled 表示 patient_user.status 非 ACTIVE（2=禁用），
 	// 不签发任何令牌，映射为 403 AUTH_FORBIDDEN。
 	ErrPatientDisabled = errors.New("patient account is disabled")
@@ -104,10 +108,11 @@ func NewService(
 	}
 }
 
-// WeChatLogin 处理 POST /api/v1/patient/auth/wechat-login：按 openId 登录或注册。
+// WeChatLogin 处理 POST /api/v1/patient/auth/wechat-login：
+// 用微信 code 换取 openid 后按 openId 登录或注册。
 //
-// openid 只能由微信签发：本方法不接受、也不缓存客户端提交的任何身份标识，
-// 因此不存在「开发期直通」实现，测试通过替换 port.WeChatAuthenticator 隔离外部依赖。
+// openid 只能由微信签发，因此本方法只接受 code、不接受客户端提交的身份标识；
+// 测试阶段的 openid 直通是另一个入口 LoginByOpenID，由 transport 层按 APP_ENV 放行。
 func (s *Service) WeChatLogin(
 	ctx context.Context,
 	code string,
@@ -134,7 +139,39 @@ func (s *Service) WeChatLogin(
 	if openID == "" {
 		return nil, patient.ErrOpenIDRequired
 	}
+	return s.loginByOpenID(ctx, openID)
+}
 
+// LoginByOpenID 是仅测试阶段（APP_ENV=development）可用的直通登录入口：
+// 跳过微信 code2Session，把调用方提交的 openid 直接当作微信签发结果使用。
+//
+// openid 是患者身份的唯一锚点且无法自证真伪，因此这里只做形状校验（1-128 字符），
+// 可信与否完全由调用方保证：transport 层必须按 APP_ENV 拦截，非 development 一律拒绝
+// （spec/04-api-contract.md §7.1 的 development 例外说明）。
+func (s *Service) LoginByOpenID(
+	ctx context.Context,
+	openID string,
+) (*LoginResult, error) {
+	openID = strings.TrimSpace(openID)
+	// 复用 code 的 1-128 字符约束，避免空串或超长串落库。
+	openIDLength := utf8.RuneCountInString(openID)
+	if openIDLength < minLoginCodeLength || openIDLength > maxLoginCodeLength {
+		return nil, ErrInvalidOpenID
+	}
+	if s.patients == nil || s.tokens == nil {
+		return nil, errors.New("patient authentication dependencies are not configured")
+	}
+
+	return s.loginByOpenID(ctx, openID)
+}
+
+// loginByOpenID 是「code 换取」与「openid 直通」两条入口的公共后半段：
+// 按 openId 登录或注册、校验账号状态、签发并保存 refresh 会话、读取就诊卡。
+// 调用方负责保证 openID 来自可信来源。
+func (s *Service) loginByOpenID(
+	ctx context.Context,
+	openID string,
+) (*LoginResult, error) {
 	// 登录与注册合一：open_id 在库中没有唯一约束，
 	// 同一 openId 的并发请求由 repository 在事务内串行化（契约 §7.1）。
 	profile, isNewUser, err := s.patients.FindOrCreatePatientByOpenID(

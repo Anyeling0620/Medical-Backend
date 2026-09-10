@@ -50,10 +50,10 @@ func isAllowedLocalhostOrigin(origin string) bool {
 		return false
 	}
 
-	//// 只检查 hostname 必须是 localhost
-	//if parsed.Hostname() != localhostCORSHost {
-	//	return false
-	//}
+	// 只检查 hostname 必须是 localhost
+	if parsed.Hostname() != localhostCORSHost {
+		return false
+	}
 
 	// 允许任何端口
 	port, err := strconv.Atoi(parsed.Port())

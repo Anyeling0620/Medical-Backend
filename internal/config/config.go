@@ -51,8 +51,8 @@ type MinIOConfig struct {
 }
 
 // WeChatConfig 是微信小程序登录（code2Session）所需的应用凭据。
-// 生产环境必须配置；开发环境允许为空，此时微信登录返回 502 DEPENDENCY_UNAVAILABLE，
-// 登录流程本身保持可用（openid 只能由微信签发，不提供本地直通实现）。
+// 生产环境必须配置；开发环境允许为空，此时 code 通道返回 502 DEPENDENCY_UNAVAILABLE，
+// 但仍可用 openid 直通登录联调（仅 APP_ENV=development 放行，见 patientauth.LoginByOpenID）。
 type WeChatConfig struct {
 	AppID  string `env:"WECHAT_APPID"`
 	Secret string `env:"WECHAT_SECRET"`
