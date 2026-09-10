@@ -14,6 +14,7 @@ import (
 	"Medical-Web-Backend/internal/transport/http/middleware"
 	userservice "Medical-Web-Backend/internal/usecase/misuser"
 	patientauthservice "Medical-Web-Backend/internal/usecase/patientauth"
+	patientcardservice "Medical-Web-Backend/internal/usecase/patientcard"
 	scheduleservice "Medical-Web-Backend/internal/usecase/schedule"
 	"Medical-Web-Backend/internal/utils"
 )
@@ -86,6 +87,17 @@ func NewRouter(
 	patientRoutes := router.Group("/api/v1/patient")
 	patientRoutes.Use(requirePatientAccess)
 	patientRoutes.GET("/me", patientAuthHandler.Me)
+
+	// 就诊卡：主体只能是令牌中的当前患者，cardId 只用于定位资源，
+	// 他人卡与不存在的卡统一 404（spec/04-api-contract.md §7.4、§12.5）。
+	// 与 /patient/me 一样复用 realm=patient 的访问令牌校验，不额外要求管理端权限。
+	patientCardHandler := handler.NewPatientCardHandler(
+		patientcardservice.NewService(patientRepository),
+	)
+	patientRoutes.GET("/cards", patientCardHandler.List)
+	patientRoutes.POST("/cards", patientCardHandler.Create)
+	patientRoutes.GET("/cards/:cardId", patientCardHandler.Detail)
+	patientRoutes.PATCH("/cards/:cardId", patientCardHandler.Update)
 
 	catalogHandler := handler.NewCatalogHandler(doctorRepository, userRepository, utils.MinioPublicURL(cfg))
 	scheduleService := scheduleservice.NewService(scheduleRepository, nil)
