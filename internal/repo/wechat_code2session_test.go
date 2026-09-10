@@ -225,3 +225,47 @@ func TestWeChatCode2SessionNetworkFailure(t *testing.T) {
 		t.Fatalf("err = %v，期望 port.ErrWeChatUnavailable", err)
 	}
 }
+
+// TestWeChatCode2SessionNetworkFailureRedactsCredential 是凭据脱敏的回归测试。
+//
+// http.Client.Do 会把 RoundTripper 返回的错误包装成 *url.Error，其 URL 字段
+// 原样携带含 appid/secret/js_code 的完整请求地址；网络失败时若直接拼接 err.Error()，
+// 微信凭据就会顺着日志、监控或响应体泄漏，例如：
+//
+//	Get "https://api.weixin.qq.com/sns/jscode2session?appid=wx-appid&secret=wx-secret&...": dial tcp: connection refused
+//
+// 本用例断言脱敏后既不出现 appid/secret 原文，又保留底层失败原因与错误归类。
+func TestWeChatCode2SessionNetworkFailureRedactsCredential(t *testing.T) {
+	// newWeChatTestClient 注入的凭据为 appid=wx-appid、secret=wx-secret，与下方断言保持一致。
+	const (
+		appID  = "wx-appid"
+		secret = "wx-secret"
+	)
+
+	client := newWeChatTestClient(t, func(*http.Request) (*http.Response, error) {
+		// 返回底层网络错误，交由 http.Client.Do 包装成携带完整 URL 的 *url.Error。
+		return nil, errors.New("dial tcp: connection refused")
+	})
+
+	_, err := client.Code2Session(context.Background(), "wx_code_abc123")
+	if err == nil {
+		t.Fatal("网络失败必须返回错误")
+	}
+
+	message := err.Error()
+	// 回归点一：错误文案不得携带微信凭据原文。
+	if strings.Contains(message, secret) {
+		t.Errorf("错误文案泄漏 secret 原文: %s", message)
+	}
+	if strings.Contains(message, appID) {
+		t.Errorf("错误文案泄漏 appid 原文: %s", message)
+	}
+	// 回归点二：脱敏只应替换凭据，不得把底层失败原因一并抹掉。
+	if !strings.Contains(message, "connection refused") {
+		t.Errorf("错误文案丢失底层失败原因，实际: %s", message)
+	}
+	// 回归点三：脱敏不得破坏错误归类，上层仍按服务不可用处理。
+	if !errors.Is(err, port.ErrWeChatUnavailable) {
+		t.Errorf("err = %v，期望 port.ErrWeChatUnavailable", err)
+	}
+}

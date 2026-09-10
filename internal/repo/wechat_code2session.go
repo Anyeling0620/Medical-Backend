@@ -45,6 +45,21 @@ func NewWeChatCode2SessionClient(appID, secret string) *WeChatCode2SessionClient
 	}
 }
 
+// redactCredential 从文案中抹去 appid 与 secret，
+// 防止微信凭据随错误信息流入日志、监控或响应体。
+func (c *WeChatCode2SessionClient) redactCredential(message string) string {
+	if c == nil {
+		return message
+	}
+	if c.secret != "" {
+		message = strings.ReplaceAll(message, c.secret, "***")
+	}
+	if c.appID != "" {
+		message = strings.ReplaceAll(message, c.appID, "***")
+	}
+	return message
+}
+
 // Code2Session 用临时 code 换取 openid。
 //
 // 微信成功时返回 200 + JSON（可能不带 errcode 字段），失败时返回 errcode/errmsg。
@@ -88,8 +103,13 @@ func (c *WeChatCode2SessionClient) Code2Session(
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		// 错误信息只包含网络错误本身，不含 URL（URL 携带 secret）。
-		return "", fmt.Errorf("%w: %v", port.ErrWeChatUnavailable, err)
+		// net/http 失败时返回的 *url.Error 会原样携带请求 URL，其中含 secret 与 js_code，
+		// 因此必须脱敏后再包装，避免该 error 被记录时泄漏微信凭据。
+		return "", fmt.Errorf(
+			"%w: %s",
+			port.ErrWeChatUnavailable,
+			c.redactCredential(err.Error()),
+		)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
