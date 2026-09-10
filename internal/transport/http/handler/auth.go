@@ -145,67 +145,12 @@ func (h *AuthHandler) setTokenCookies(
 	c *gin.Context,
 	pair userservice.TokenPair,
 ) {
-	setCookie(
-		c,
-		userservice.AccessCookieName,
-		pair.AccessToken,
-		cookieAge(pair.AccessExpiresAt),
-		h.secure,
-	)
-
-	setCookie(
-		c,
-		userservice.RefreshCookieName,
-		pair.RefreshToken,
-		cookieAge(pair.RefreshExpiresAt),
-		h.secure,
-	)
+	// Cookie 名与安全属性由包级函数统一实现，管理端与患者端共用一份。
+	setTokenCookies(c, pair, h.secure)
 }
 
 func (h *AuthHandler) clearTokenCookies(c *gin.Context) {
-	setCookie(
-		c,
-		userservice.AccessCookieName,
-		"",
-		-1,
-		h.secure,
-	)
-
-	setCookie(
-		c,
-		userservice.RefreshCookieName,
-		"",
-		-1,
-		h.secure,
-	)
-}
-
-func setCookie(
-	c *gin.Context,
-	name string,
-	value string,
-	maxAge int,
-	secure bool,
-) {
-	cookie := (&http.Cookie{
-		Name:     name,
-		Value:    value,
-		Path:     "/",
-		MaxAge:   maxAge,
-		HttpOnly: true,
-		Secure:   secure,
-		SameSite: http.SameSiteLaxMode,
-	}).String()
-
-	c.Writer.Header().Add("Set-Cookie", cookie)
-}
-
-func cookieAge(expiresAt time.Time) int {
-	seconds := int(time.Until(expiresAt).Seconds())
-	if seconds < 1 {
-		return 1
-	}
-	return seconds
+	clearTokenCookies(c, h.secure)
 }
 
 // bindError 区分 JSON 语法错误（400）与字段缺失/类型错误（422）。

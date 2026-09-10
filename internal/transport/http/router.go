@@ -13,6 +13,7 @@ import (
 	"Medical-Web-Backend/internal/transport/http/handler"
 	"Medical-Web-Backend/internal/transport/http/middleware"
 	userservice "Medical-Web-Backend/internal/usecase/misuser"
+	patientauthservice "Medical-Web-Backend/internal/usecase/patientauth"
 	scheduleservice "Medical-Web-Backend/internal/usecase/schedule"
 	"Medical-Web-Backend/internal/utils"
 )
@@ -25,6 +26,8 @@ func NewRouter(
 	doctorRepository *repo.PostgresDoctorRepository,
 	scheduleRepository *repo.PostgresScheduleRepository,
 	idempotencyStore port.IdempotencyStore,
+	patientRepository port.PatientRepository,
+	wechatAuthenticator port.WeChatAuthenticator,
 ) *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
@@ -53,6 +56,37 @@ func NewRouter(
 	authRoutes.POST("/login", authHandler.Login)
 	authRoutes.POST("/refresh", authHandler.Refresh)
 	authRoutes.POST("/logout", authHandler.Logout)
+
+	// 患者端认证：wechat-login/refresh/logout 自带凭据校验，不经过访问令牌中间件；
+	// 只有 GET /patient/me 需要 realm=patient 的访问令牌。
+	// 两个域的令牌共用同一 Redis 会话层，隔离只由 realm 决定。
+	patientService := patientauthservice.NewService(
+		patientRepository,
+		tokenRepository,
+		wechatAuthenticator,
+		patientauthservice.Config{
+			JWTSecret:  cfg.Auth.JWTSecret,
+			AccessTTL:  cfg.Auth.AccessTTL,
+			RefreshTTL: cfg.Auth.RefreshTTL,
+		},
+	)
+	patientAuthHandler := handler.NewPatientAuthHandler(
+		patientService,
+		cfg.Auth.CookieSecure,
+	)
+	patientAuthRoutes := router.Group("/api/v1/patient/auth")
+	patientAuthRoutes.POST("/wechat-login", patientAuthHandler.WeChatLogin)
+	patientAuthRoutes.POST("/refresh", patientAuthHandler.Refresh)
+	patientAuthRoutes.POST("/logout", patientAuthHandler.Logout)
+
+	requirePatientAccess := middleware.RequireAccessToken(
+		patientService,
+		domainauth.RealmPatient,
+	)
+	patientRoutes := router.Group("/api/v1/patient")
+	patientRoutes.Use(requirePatientAccess)
+	patientRoutes.GET("/me", patientAuthHandler.Me)
+
 	catalogHandler := handler.NewCatalogHandler(doctorRepository, userRepository, utils.MinioPublicURL(cfg))
 	scheduleService := scheduleservice.NewService(scheduleRepository, nil)
 	scheduleHandler := handler.NewScheduleHandler(scheduleService, idempotencyStore)
