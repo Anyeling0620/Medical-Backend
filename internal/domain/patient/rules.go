@@ -353,8 +353,9 @@ func NewCard(userID int64, cardUUID string, input CardInput, now time.Time) (Car
 	}, nil
 }
 
-// CardUpdate 描述 PATCH 就诊卡的入参。指针为 nil 表示本次不修改该字段，
-// 与“显式提交 null”区分开。
+// CardUpdate 描述 PATCH 就诊卡的入参。指针为 nil 一律表示本次不修改该字段：
+// 本类型不区分“键不存在”与“显式提交 null”，后者的区分由请求层用 json.RawMessage
+// 保留原始键信息完成（见 internal/transport/http/request 的 UpdatePatientCardRequest.Update）。
 //
 // PID、UserID、Birthday 不可修改，但仍在此声明，用于把“客户端提交了不可修改字段”
 // 和“客户端没提交”区分开：契约要求提交 pid 返回 422 PATIENT_CARD_PID_IMMUTABLE，

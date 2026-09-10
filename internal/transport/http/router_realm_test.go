@@ -254,7 +254,9 @@ func TestRouterPatientMeIsGuardedByPatientRealm(t *testing.T) {
 }
 
 // TestRouterUnregisteredPatientPathsStayNotFound 断言 realm 校验只作用于已注册路由：
-// 尚未实现的患者域路径（就诊卡接口属于后续工作包）仍由 gin 返回 404。
+// 尚未注册的患者域路径仍由 gin 返回 404，而不是被患者域中间件拦成 401。
+// 这里刻意使用一个永远不会被注册的路径：若改用「尚未实现的业务接口」作为哨兵
+// （例如先前的就诊卡接口），一旦该接口落地实现，本用例就会失败。
 func TestRouterUnregisteredPatientPathsStayNotFound(t *testing.T) {
 	router, misToken := newRealmTestRouter(t, domainauth.RealmMis)
 
@@ -262,13 +264,13 @@ func TestRouterUnregisteredPatientPathsStayNotFound(t *testing.T) {
 		w := performRealmRequest(
 			router,
 			http.MethodGet,
-			"/api/v1/patient/cards",
+			"/api/v1/patient/not-registered-path",
 			token,
 		)
 
 		if w.Code != http.StatusNotFound {
 			t.Errorf(
-				"GET /api/v1/patient/cards（携带令牌=%t）status = %d, want 404; body=%s",
+				"GET /api/v1/patient/not-registered-path（携带令牌=%t）status = %d, want 404; body=%s",
 				token != "",
 				w.Code,
 				w.Body.String(),
