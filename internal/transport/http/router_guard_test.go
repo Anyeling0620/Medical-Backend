@@ -24,6 +24,16 @@ var anonymousAllowedRoutePaths = map[string]bool{
 	"/api/v1/patient/auth/wechat-login": true,
 	"/api/v1/patient/auth/refresh":      true,
 	"/api/v1/patient/auth/logout":       true,
+
+	// 匿名公开查询域（spec/04-api-contract.md §1.2、§8）：/public/* 是匿名只读域，
+	// 不读取也不要求令牌，携带无效或跨域令牌同样必须返回正常业务响应；
+	// 因此这些路由不属于「必须拒绝匿名请求」的受保护路由。
+	"/api/v1/public/departments":                              true,
+	"/api/v1/public/departments/:departmentId":                true,
+	"/api/v1/public/departments/:departmentId/subdepartments": true,
+	"/api/v1/public/doctors":                                  true,
+	"/api/v1/public/doctors/:doctorId":                        true,
+	"/api/v1/public/schedules":                                true,
 }
 
 // resolveRouteParams 把 gin 路由模板中的参数段替换为可请求的占位值，

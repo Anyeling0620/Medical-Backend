@@ -140,6 +140,13 @@ func TestRouterExposesContractRoutes(t *testing.T) {
 		"POST /api/v1/patient/auth/refresh",
 		"POST /api/v1/patient/auth/logout",
 		"GET /api/v1/patient/me",
+		// 公开查询域（规范第 8 章）
+		"GET /api/v1/public/departments",
+		"GET /api/v1/public/departments/:departmentId",
+		"GET /api/v1/public/departments/:departmentId/subdepartments",
+		"GET /api/v1/public/doctors",
+		"GET /api/v1/public/doctors/:doctorId",
+		"GET /api/v1/public/schedules",
 	}
 
 	for _, want := range required {
