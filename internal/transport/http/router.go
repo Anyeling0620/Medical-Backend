@@ -15,6 +15,7 @@ import (
 	userservice "Medical-Web-Backend/internal/usecase/misuser"
 	patientauthservice "Medical-Web-Backend/internal/usecase/patientauth"
 	patientcardservice "Medical-Web-Backend/internal/usecase/patientcard"
+	publiccatalogservice "Medical-Web-Backend/internal/usecase/publiccatalog"
 	scheduleservice "Medical-Web-Backend/internal/usecase/schedule"
 	"Medical-Web-Backend/internal/utils"
 )
@@ -98,6 +99,19 @@ func NewRouter(
 	patientRoutes.POST("/cards", patientCardHandler.Create)
 	patientRoutes.GET("/cards/:cardId", patientCardHandler.Detail)
 	patientRoutes.PATCH("/cards/:cardId", patientCardHandler.Update)
+
+	// 公开查询域（/api/v1/public/*）：匿名只读，不读取也不要求令牌，
+	// 因此不挂 RequireAccessToken / RequirePermissions：携带无效或跨域令牌也必须正常返回
+	// （测试策略「匿名公开域」）。数据可见性与字段裁剪由 publiccatalog 用例与公开域 repository 保证。
+	publicService := publiccatalogservice.NewService(doctorRepository, scheduleRepository, nil)
+	publicHandler := handler.NewPublicCatalogHandler(publicService, utils.MinioPublicURL(cfg))
+	publicRoutes := router.Group("/api/v1/public")
+	publicRoutes.GET("/departments", publicHandler.ListDepartments)
+	publicRoutes.GET("/departments/:departmentId", publicHandler.DepartmentDetail)
+	publicRoutes.GET("/departments/:departmentId/subdepartments", publicHandler.Subdepartments)
+	publicRoutes.GET("/doctors", publicHandler.Doctors)
+	publicRoutes.GET("/doctors/:doctorId", publicHandler.DoctorDetail)
+	publicRoutes.GET("/schedules", publicHandler.Schedules)
 
 	catalogHandler := handler.NewCatalogHandler(doctorRepository, userRepository, utils.MinioPublicURL(cfg))
 	scheduleService := scheduleservice.NewService(scheduleRepository, nil)
