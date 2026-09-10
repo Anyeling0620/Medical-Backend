@@ -66,6 +66,7 @@ func NewApp(cfg config.Config) (*App, error) {
 		repo.NewRedisIdempotencyStore(connectedClients.redis),
 		repo.NewPostgresPatientRepository(connectedClients.postgres),
 		repo.NewWeChatCode2SessionClient(cfg.WeChat.AppID, cfg.WeChat.Secret),
+		repo.NewPostgresRegistrationRepository(connectedClients.postgres),
 	)
 
 	return &App{cfg: cfg, server: server, clients: connectedClients, dependencies: dependencies}, nil

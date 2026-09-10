@@ -117,7 +117,17 @@ func TestRouterEveryProtectedRouteRejectsAnonymousRequest(t *testing.T) {
 // patientRealmExemptPrefixes 是允许接受患者域令牌的路由前缀。
 // 该前缀之外的路由一律不得接受 realm=patient 的令牌；后续新增患者域路由时
 // 必须把它的前缀登记到这里，否则会被本用例拦下（提示同步维护白名单）。
-var patientRealmExemptPrefixes = []string{"/api/v1/patient/"}
+//
+// 除患者域自身外，双 realm 共享业务路由（/api/v1/registrations/*，以及后续的
+// /payments/*、/consultations/*、/prescriptions/*）也接受患者域令牌：
+// 这些路由是「管理端带权限码、患者端只能访问本人资源」的共享业务接口
+// （spec/04-api-contract.md §1.2），因此同样登记在此。
+var patientRealmExemptPrefixes = []string{
+	"/api/v1/patient/",
+	// 注意不带结尾斜杠：共享业务集合自身（POST /api/v1/registrations）与它的子路径
+	// 都属于同一组共享业务路由。
+	"/api/v1/registrations",
+}
 
 // TestRouterNonPatientRoutesRejectPatientRealmToken 遍历整张路由表，断言除公开白名单
 // 与患者域前缀外的每条路由都拒绝 realm=patient 的合法令牌（401 AUTH_INVALID_TOKEN）。

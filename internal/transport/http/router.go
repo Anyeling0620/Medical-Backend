@@ -16,6 +16,7 @@ import (
 	patientauthservice "Medical-Web-Backend/internal/usecase/patientauth"
 	patientcardservice "Medical-Web-Backend/internal/usecase/patientcard"
 	publiccatalogservice "Medical-Web-Backend/internal/usecase/publiccatalog"
+	registrationservice "Medical-Web-Backend/internal/usecase/registration"
 	scheduleservice "Medical-Web-Backend/internal/usecase/schedule"
 	"Medical-Web-Backend/internal/utils"
 )
@@ -30,6 +31,7 @@ func NewRouter(
 	idempotencyStore port.IdempotencyStore,
 	patientRepository port.PatientRepository,
 	wechatAuthenticator port.WeChatAuthenticator,
+	registrationRepository port.RegistrationRepository,
 ) *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
@@ -157,6 +159,37 @@ func NewRouter(
 	scheduleWriteRoutes.POST("/plans/:planId/slots", scheduleSlotHandler.CreateSlot)
 	scheduleWriteRoutes.PATCH("/slots/:slotId", scheduleSlotHandler.UpdateSlotMaximum)
 	scheduleWriteRoutes.DELETE("/slots/:slotId", scheduleSlotHandler.DeleteSlot)
+
+	// 挂号域（/api/v1/registrations/*）是双 realm 共享业务接口
+	// （spec/04-api-contract.md §1.2、§6）：管理端令牌必须带权限编码，
+	// 患者端令牌只能操作本人就诊卡名下的资源，越权与不存在统一按资源不存在处理。
+	//
+	// 因此这里不能复用单一 realm 的 RequireAccessToken：
+	//   - RequireSharedAccess 同时接受 patient/mis 两种 realm 的访问令牌；
+	//   - RequirePermissionOrPatient 对管理端令牌校验权限编码，对患者令牌放行并由用例按 404 隐藏越权。
+	// 权限编码以数据库 mis_permission 已有记录为准（契约 §1.2）：SELECT 用 REGISTRATION:SELECT，
+	// 建单同时接受规格约定的 REGISTRATION:WRITE 与库中实际存在的 REGISTRATION:INSERT。
+	registrationService := registrationservice.NewService(
+		registrationRepository,
+		patientRepository,
+		patientRepository,
+		nil,
+	)
+	registrationHandler := handler.NewRegistrationHandler(registrationService, idempotencyStore)
+	requireRegistrationSelect := middleware.RequirePermissionOrPatient(
+		userRepository,
+		[]string{"ROOT", "REGISTRATION:SELECT"},
+	)
+	requireRegistrationWrite := middleware.RequirePermissionOrPatient(
+		userRepository,
+		[]string{"ROOT", "REGISTRATION:WRITE", "REGISTRATION:INSERT"},
+	)
+	registrationRoutes := router.Group("/api/v1/registrations")
+	registrationRoutes.Use(middleware.RequireSharedAccess(patientService, service))
+	registrationRoutes.POST("/eligibility", requireRegistrationSelect, registrationHandler.Eligibility)
+	registrationRoutes.POST("", requireRegistrationWrite, registrationHandler.Create)
+	registrationRoutes.GET("", requireRegistrationSelect, registrationHandler.List)
+	registrationRoutes.GET("/:registrationId", requireRegistrationSelect, registrationHandler.Detail)
 
 	return router
 }

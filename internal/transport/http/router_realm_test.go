@@ -59,6 +59,7 @@ func newRealmTestRouter(t *testing.T, realm domainauth.Realm) (*gin.Engine, stri
 		nil, // idempotencyStore
 		nil, // patientRepository
 		nil, // wechatAuthenticator
+		nil, // registrationRepository
 	)
 
 	claims := &userservice.AccessClaims{
