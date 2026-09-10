@@ -6,19 +6,27 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	domainauth "Medical-Web-Backend/internal/domain/auth"
 	userservice "Medical-Web-Backend/internal/usecase/misuser"
 )
 
 const ClaimsKey = "auth.claims"
 
-func RequireAccessToken(service *userservice.Service) gin.HandlerFunc {
+// RequireAccessToken 构造访问令牌校验中间件。
+// 只有 realm 与 expectedRealm 一致的令牌才会被接受：管理域传 RealmMis，
+// 患者域传 RealmPatient。令牌 realm 不匹配（例如患者令牌访问管理端接口）时
+// 统一按无效令牌返回 401 AUTH_INVALID_TOKEN，绝不回退到另一域解释同一个令牌。
+func RequireAccessToken(
+	service *userservice.Service,
+	expectedRealm domainauth.Realm,
+) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var claims *userservice.AccessClaims
 
 		// 优先读取 Authorization 请求头。
 		// 如果请求头中的 token 无效，再尝试读取 Cookie 中的 access token。
 		for _, rawToken := range accessTokenCandidates(c) {
-			parsedClaims, err := service.ParseAccessToken(rawToken)
+			parsedClaims, err := service.ParseAccessToken(rawToken, expectedRealm)
 			if err != nil {
 				continue
 			}

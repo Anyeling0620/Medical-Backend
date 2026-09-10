@@ -12,6 +12,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 
 	"Medical-Web-Backend/internal/config"
+	domainauth "Medical-Web-Backend/internal/domain/auth"
 	"Medical-Web-Backend/internal/port"
 	userservice "Medical-Web-Backend/internal/usecase/misuser"
 )
@@ -61,6 +62,7 @@ func newContractTestRouterWithAccessToken(t *testing.T) (*gin.Engine, string) {
 
 	claims := &userservice.AccessClaims{
 		TokenType: userservice.TokenTypeAccess,
+		Realm:     domainauth.RealmMis,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ID:        "contract-test-jti",
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(15 * time.Minute)),
@@ -168,8 +170,7 @@ func TestRouterDoesNotExposeLegacyRoutes(t *testing.T) {
 
 // TestRouterLegacyPathsReturnNotFound 在携带合法 access token 的前提下访问
 // 已删除的旧接口，应落入 gin 的 no-route 处理并返回 404。
-// 注意：gin 引擎级 RequireAccessToken 也会先执行于未匹配路径，
-// 因此必须带 token，匿名请求会先得到 401。
+// 注意：访问令牌校验已改为按认证域挂在具体路由组上，未匹配路径不再经过该中间件。
 func TestRouterLegacyPathsReturnNotFound(t *testing.T) {
 	router, accessToken := newContractTestRouterWithAccessToken(t)
 

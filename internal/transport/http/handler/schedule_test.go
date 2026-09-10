@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	domainauth "Medical-Web-Backend/internal/domain/auth"
 	"Medical-Web-Backend/internal/domain/schedule"
 	"Medical-Web-Backend/internal/port"
 	"Medical-Web-Backend/internal/transport/http/middleware"
@@ -250,9 +251,13 @@ func newScheduleEnv(t *testing.T) *scheduleHandlerEnv {
 	})
 	h := NewScheduleHandler(service, store)
 	engine := gin.New()
-	// 模拟 RequireAccessToken 设置的 claims（handler 只依赖 claims.UserID）。
+	// 模拟 RequireAccessToken(RealmMis) 设置的 claims（handler 只依赖 claims.UserID，
+	// 但 realm 必须为 mis 才是合法状态，避免夹具与中间件语义不一致）。
 	engine.Use(func(c *gin.Context) {
-		c.Set(middleware.ClaimsKey, &userservice.AccessClaims{UserID: 1})
+		c.Set(middleware.ClaimsKey, &userservice.AccessClaims{
+			UserID: 1,
+			Realm:  domainauth.RealmMis,
+		})
 		c.Next()
 	})
 	engine.GET("/api/v1/schedule/plans", h.ListPlans)

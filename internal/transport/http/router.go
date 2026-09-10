@@ -7,6 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"Medical-Web-Backend/internal/config"
+	domainauth "Medical-Web-Backend/internal/domain/auth"
 	"Medical-Web-Backend/internal/port"
 	"Medical-Web-Backend/internal/repo"
 	"Medical-Web-Backend/internal/transport/http/handler"
@@ -56,8 +57,16 @@ func NewRouter(
 	scheduleService := scheduleservice.NewService(scheduleRepository, nil)
 	scheduleHandler := handler.NewScheduleHandler(scheduleService, idempotencyStore)
 	scheduleSlotHandler := handler.NewScheduleSlotHandler(scheduleService, idempotencyStore)
-	router.Use(middleware.RequireAccessToken(service))
+	// 受保护接口按认证域分组挂载访问令牌校验，而不是挂在引擎级：
+	// 引擎级中间件无法区分 realm，会让后续新增的 /api/v1/patient/* 被管理域校验误拦。
+	// 管理端接口（/mis、/catalog、/schedule）只接受 realm=mis 的令牌。
+	requireMisAccess := middleware.RequireAccessToken(
+		service,
+		domainauth.RealmMis,
+	)
+
 	catalogRoutes := router.Group("/api/v1/catalog")
+	catalogRoutes.Use(requireMisAccess)
 	catalogRoutes.Use(middleware.RequirePermissions(userRepository, []string{"ROOT", "CATALOG:SELECT"}))
 	catalogRoutes.GET("/departments", catalogHandler.ListDepartments)
 	catalogRoutes.GET("/departments/:departmentId", catalogHandler.Detail)
@@ -71,11 +80,13 @@ func NewRouter(
 	// 排班：查询走 SCHEDULE:SELECT，写操作走 SCHEDULE:WRITE（均允许 ROOT）。
 	// 计划接口在前，时段接口复用同一服务实例；两类接口共用 SCHEDULE:SELECT/WRITE 权限。
 	scheduleSelectRoutes := router.Group("/api/v1/schedule")
+	scheduleSelectRoutes.Use(requireMisAccess)
 	scheduleSelectRoutes.Use(middleware.RequirePermissions(userRepository, []string{"ROOT", "SCHEDULE:SELECT"}))
 	scheduleSelectRoutes.GET("/plans", scheduleHandler.ListPlans)
 	scheduleSelectRoutes.GET("/plans/:planId/slots", scheduleSlotHandler.ListSlots)
 
 	scheduleWriteRoutes := router.Group("/api/v1/schedule")
+	scheduleWriteRoutes.Use(requireMisAccess)
 	scheduleWriteRoutes.Use(middleware.RequirePermissions(userRepository, []string{"ROOT", "SCHEDULE:WRITE"}))
 	scheduleWriteRoutes.POST("/plans", scheduleHandler.CreatePlan)
 	scheduleWriteRoutes.PATCH("/plans/:planId", scheduleHandler.UpdatePlan)

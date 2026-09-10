@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	domainauth "Medical-Web-Backend/internal/domain/auth"
 	"Medical-Web-Backend/internal/transport/http/middleware"
 	"Medical-Web-Backend/internal/transport/http/request"
 	"Medical-Web-Backend/internal/transport/http/response"
@@ -63,6 +64,7 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 	result, err := h.service.Refresh(
 		c.Request.Context(),
 		refreshToken,
+		domainauth.RealmMis,
 	)
 	if err != nil {
 		h.writeError(c, http.StatusUnauthorized, "AUTH_INVALID_REFRESH_TOKEN", "刷新令牌无效或已过期")
@@ -92,6 +94,7 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 			c.Request.Context(),
 			"",
 			refreshToken,
+			domainauth.RealmMis,
 		); err != nil {
 			h.writeError(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "退出登录失败")
 			return
@@ -111,6 +114,7 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 		c.Request.Context(),
 		accessToken,
 		"",
+		domainauth.RealmMis,
 	); err != nil &&
 		!errors.Is(err, userservice.ErrInvalidToken) {
 		h.writeError(c, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "退出登录失败")

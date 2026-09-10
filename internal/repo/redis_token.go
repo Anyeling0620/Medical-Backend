@@ -3,6 +3,7 @@ package repo
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -44,6 +45,10 @@ func (r *RedisTokenRepository) GetRefreshSession(ctx context.Context, tokenHash 
 	}
 	payload, err := r.client.Get(ctx, refreshKey(tokenHash)).Bytes()
 	if err != nil {
+		// 键不存在表示会话已过期或已被轮换，用哨兵错误与真正的读取失败区分。
+		if errors.Is(err, redis.Nil) {
+			return nil, port.ErrRefreshSessionNotFound
+		}
 		return nil, err
 	}
 	var session port.RefreshSession

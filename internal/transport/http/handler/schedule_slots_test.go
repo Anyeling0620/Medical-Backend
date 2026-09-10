@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	domainauth "Medical-Web-Backend/internal/domain/auth"
 	"Medical-Web-Backend/internal/domain/schedule"
 	"Medical-Web-Backend/internal/port"
 	"Medical-Web-Backend/internal/transport/http/middleware"
@@ -255,6 +256,7 @@ func (s *slotRepoStub) DeleteSlot(_ context.Context, slotID int64, now time.Time
 
 // newScheduleSlotEngine 用真实 Service + 内存 repo + 固定 now + 幂等 store fake 构造
 // 四个接口路由；userID > 0 时预置 access claims 上下文（handler 从 claims 取 UserID）。
+// 预置的 claims 带 realm=mis，与 RequireAccessToken(RealmMis) 放行后的状态一致。
 func newScheduleSlotEngine(t *testing.T, stub *slotRepoStub, store *memIdempotencyStore, userID int64) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
@@ -263,7 +265,10 @@ func newScheduleSlotEngine(t *testing.T, stub *slotRepoStub, store *memIdempoten
 	e := gin.New()
 	if userID > 0 {
 		e.Use(func(c *gin.Context) {
-			c.Set(middleware.ClaimsKey, &misuser.AccessClaims{UserID: userID})
+			c.Set(middleware.ClaimsKey, &misuser.AccessClaims{
+				UserID: userID,
+				Realm:  domainauth.RealmMis,
+			})
 		})
 	}
 	e.GET("/api/v1/schedule/plans/:planId/slots", slotHandler.ListSlots)

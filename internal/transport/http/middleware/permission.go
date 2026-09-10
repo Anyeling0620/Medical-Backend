@@ -5,12 +5,16 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	domainauth "Medical-Web-Backend/internal/domain/auth"
 	"Medical-Web-Backend/internal/port"
 	userservice "Medical-Web-Backend/internal/usecase/misuser"
 )
 
 // RequirePermissions checks whether the authenticated user has at least one
 // permission from the allowed list.
+// 按 spec/02-architecture.md「认证与令牌边界」，权限中间件必须先断言 realm=mis，
+// 再按 claims 中的主体查询管理端权限表；禁止用患者主体查询管理端权限，
+// 否则共享业务路由一旦漏挂 realm 门禁，患者 ID 可能命中同号管理用户而越权。
 func RequirePermissions(
 	userRepository port.UserRepository,
 	allowed []string,
@@ -19,7 +23,8 @@ func RequirePermissions(
 		value, exists := c.Get(ClaimsKey)
 		claims, ok := value.(*userservice.AccessClaims)
 
-		if !exists || !ok || claims == nil {
+		if !exists || !ok || claims == nil ||
+			claims.Realm != domainauth.RealmMis {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"code":    "AUTH_INVALID_TOKEN",
 				"message": "访问令牌无效或已过期",
