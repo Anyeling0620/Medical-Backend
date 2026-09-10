@@ -511,6 +511,23 @@ func slotPlanID(ctx context.Context, tx *sql.Tx, slotID int64) (int64, error) {
 	return planID, nil
 }
 
+// planDoctorActive 事务内判定计划所属医生当前是否具备出诊资格（doctor.status=1 ACTIVE）。
+// 离职(2)、退休(3)、隐藏(4) 以及医生记录缺失（数据异常）一律返回 false：医生资格是发号
+// 前置条件，宁可拒绝也不能为已离职/退休医生继续放号。
+// 这里读的是医生行快照（不取行锁，避免与医生资料更新互锁），与计划创建路径的
+// TxDoctorAssociation 判定口径一致；只能把并发改状态的影响窗口缩小到本事务提交前。
+// 若后续新增医生资料写接口，需要在此处改用 FOR KEY SHARE 才能真正封闭该窗口。
+func planDoctorActive(ctx context.Context, tx *sql.Tx, planID int64) (bool, error) {
+	var active bool
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+SELECT 1 FROM hospital.doctor_work_plan p JOIN hospital.doctor d ON d.id=p.doctor_id
+WHERE p.id=$1 AND d.status=1)`, planID).Scan(&active)
+	if err != nil {
+		return false, err
+	}
+	return active, nil
+}
+
 // lockSlot 事务内锁定时段并返回完整记录；不存在返回 ErrSlotNotFound。
 func lockSlot(ctx context.Context, tx *sql.Tx, slotID int64) (schedule.ScheduleSlot, error) {
 	row := tx.QueryRowContext(ctx, "SELECT id, work_plan_id, slot, maximum, num FROM hospital.doctor_work_plan_schedule WHERE id=$1 FOR UPDATE", slotID)
@@ -535,7 +552,8 @@ func (r *PostgresScheduleRepository) hasRegistrations(ctx context.Context, tx *s
 }
 
 // CreateSlot 事务内创建时段：计划不存在返回 ErrPlanNotFound；
-// 计划已开始/已结束返回 ErrSlotLocked；同计划时段重复返回 ErrSlotExists；
+// 计划已开始/已结束返回 ErrSlotLocked；计划所属医生已离职/退休等非在诊状态返回
+// ErrDoctorInactive（422 REQUEST_VALIDATION_FAILED）；同计划时段重复返回 ErrSlotExists；
 // 参数不合法返回对应校验错误；成功后返回含 remaining 的完整资源。
 func (r *PostgresScheduleRepository) CreateSlot(ctx context.Context, value schedule.ScheduleSlot, now time.Time) (*schedule.ScheduleSlot, error) {
 	if err := value.ValidateNew(); err != nil {
@@ -550,6 +568,14 @@ func (r *PostgresScheduleRepository) CreateSlot(ctx context.Context, value sched
 		plan := schedule.WorkPlan{Date: date}
 		if !plan.CanModify(now) {
 			return schedule.ErrSlotLocked
+		}
+		// 医生资格校验：离职/退休/隐藏医生不得新增出诊时段。
+		doctorActive, err := planDoctorActive(ctx, tx, value.WorkPlanID)
+		if err != nil {
+			return err
+		}
+		if !doctorActive {
+			return schedule.ErrDoctorInactive
 		}
 		var exists bool
 		err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM hospital.doctor_work_plan_schedule WHERE work_plan_id=$1 AND slot=$2)", value.WorkPlanID, value.Slot).Scan(&exists)

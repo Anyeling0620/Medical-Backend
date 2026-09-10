@@ -192,6 +192,9 @@ func resolveSlotError(err error) (int, string, map[string]any) {
 			details["used"] = belowErr.Used
 		}
 		return http.StatusConflict, "SCHEDULE_CONFLICT", details
+	case errors.Is(err, schedule.ErrDoctorInactive):
+		// 医生已离职/退休或非在诊属于资格失败，按错误码目录归入 422 REQUEST_VALIDATION_FAILED。
+		return http.StatusUnprocessableEntity, "REQUEST_VALIDATION_FAILED", nil
 	case errors.Is(err, schedule.ErrInvalidSlot):
 		return http.StatusUnprocessableEntity, "REQUEST_VALIDATION_FAILED", nil
 	case errors.Is(err, schedule.ErrInvalidWorkPlan):
@@ -212,6 +215,8 @@ func createSlotLockedMessage(err error) string {
 		return "该时段已存在"
 	case errors.Is(err, schedule.ErrSlotLocked):
 		return "排班已开始或已结束，不能新增时段"
+	case errors.Is(err, schedule.ErrDoctorInactive):
+		return "医生已离职、退休或不在出诊状态，不能新增出诊时段"
 	default:
 		return "时段创建失败"
 	}

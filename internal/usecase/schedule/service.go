@@ -274,7 +274,10 @@ func (s *Service) ListSlotsByPlan(ctx context.Context, planID int64) ([]schedule
 }
 
 // CreateSlot 创建时段：计划不存在返回 ErrPlanNotFound；重复时段返回 ErrSlotExists；
-// 已开始计划返回 ErrSlotLocked。成功返回含 remaining 的资源对象。
+// 已开始计划返回 ErrSlotLocked；计划所属医生已离职/退休等非在诊状态返回 ErrDoctorInactive。
+// 医生资格在仓储事务内与计划状态一起校验（读取医生行快照），
+// 把“先查后写”之间医生状态被改动的窗口缩小到本事务提交前。
+// 成功返回含 remaining 的资源对象。
 func (s *Service) CreateSlot(ctx context.Context, input schedule.ScheduleSlot) (*schedule.ScheduleSlot, error) {
 	if s == nil || s.repo == nil {
 		return nil, schedule.ErrInvalidWorkPlan
