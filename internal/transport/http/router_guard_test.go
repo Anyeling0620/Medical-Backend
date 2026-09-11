@@ -34,6 +34,11 @@ var anonymousAllowedRoutePaths = map[string]bool{
 	"/api/v1/public/doctors":                                  true,
 	"/api/v1/public/doctors/:doctorId":                        true,
 	"/api/v1/public/schedules":                                true,
+
+	// 支付宝异步通知入口是 provider 回调：不读取用户 token、不进入权限矩阵，
+	// 信任来源只有 RSA2 验签，因此同样不属于「必须拒绝匿名请求」的受保护路由
+	// （spec/04-api-contract.md §1.2、§6.7）。
+	"/api/v1/payments/alipay/notify": true,
 }
 
 // resolveRouteParams 把 gin 路由模板中的参数段替换为可请求的占位值，
@@ -127,6 +132,7 @@ var patientRealmExemptPrefixes = []string{
 	// 注意不带结尾斜杠：共享业务集合自身（POST /api/v1/registrations）与它的子路径
 	// 都属于同一组共享业务路由。
 	"/api/v1/registrations",
+	"/api/v1/payments",
 }
 
 // TestRouterNonPatientRoutesRejectPatientRealmToken 遍历整张路由表，断言除公开白名单
@@ -197,4 +203,35 @@ func hasExemptPrefix(path string, prefixes []string) bool {
 		}
 	}
 	return false
+}
+
+// TestRouterAlipayNotifyReachableAnonymously 单独覆盖支付宝异步通知入口的匿名可达性（审查 P3-3）：
+// 该路由是 provider 回调，不读取任何用户令牌，因此匿名请求绝不能因为缺少令牌返回 401
+// （返回 401 会让支付宝认为通知失败并持续重试）。用例不注入支付仓储，因此走不到业务成功分支，
+// 重点断言「请求确实进入了业务处理、没有被令牌中间件拦下」。
+func TestRouterAlipayNotifyReachableAnonymously(t *testing.T) {
+	router := newContractTestRouter(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/payments/alipay/notify",
+		strings.NewReader("out_trade_no=202609080001&trade_status=TRADE_SUCCESS&total_amount=80.00"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	// 允许的状态码：400/422 是验签或表单相关失败，500 是本用例未注入支付仓储导致的内部错误；
+	// 唯独不允许 401（被令牌中间件拦下）与 404（路由未注册）。
+	switch w.Code {
+	case http.StatusBadRequest, http.StatusUnprocessableEntity, http.StatusInternalServerError:
+	default:
+		t.Fatalf("匿名通知状态码 = %d，期望 400/422/500（进入业务处理且不读令牌）; body=%s",
+			w.Code, w.Body.String())
+	}
+
+	// 响应体可能是纯文本 success，也可能是统一错误 envelope；是 JSON 时不得是令牌错误。
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err == nil {
+		if body["code"] == "AUTH_INVALID_TOKEN" {
+			t.Fatalf("匿名通知被令牌中间件拦截：code=%v; body=%s", body["code"], w.Body.String())
+		}
+	}
 }

@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/caarlos0/env/v11"
@@ -18,6 +19,7 @@ type Config struct {
 	MinIO    MinIOConfig
 	Auth     AuthConfig
 	WeChat   WeChatConfig
+	Alipay   AlipayConfig
 }
 
 type AppConfig struct {
@@ -56,6 +58,45 @@ type MinIOConfig struct {
 type WeChatConfig struct {
 	AppID  string `env:"WECHAT_APPID"`
 	Secret string `env:"WECHAT_SECRET"`
+}
+
+// AlipayConfig 是支付宝当面付（alipay.trade.precreate / alipay.trade.query /
+// 异步通知验签）所需配置。凭据缺失不阻断启动：调用时返回 502
+// PAYMENT_PROVIDER_UNAVAILABLE（与微信适配器同一取舍，见 bootstrap.NewApp 的启动提示）。
+type AlipayConfig struct {
+	// AppID 是支付宝开放平台分配给开发者的应用 ID。
+	AppID string `env:"ALIPAY_APP_ID"`
+	// PrivateKey 是应用私钥（PKCS#1/PKCS#8 的 base64 或 PEM），用于请求签名。
+	PrivateKey string `env:"ALIPAY_APP_PRIVATE_SECRET"`
+	// PublicKey 是支付宝公钥，用于异步通知验签与同步响应验签。
+	PublicKey string `env:"ALIPAY_PUBLIC_SECRET"`
+	// GatewayURL 是网关地址：生产 https://openapi.alipay.com/gateway.do，
+	// 沙箱 https://openapi-sandbox.dl.alipaydev.com/gateway.do。
+	GatewayURL string `env:"ALIPAY_GATEWAY_URL" envDefault:"https://openapi.alipay.com/gateway.do"`
+	// Subject 是支付宝订单标题，不可含 / = & 等特殊字符。
+	Subject string `env:"ALIPAY_SUBJECT" envDefault:"医院挂号费"`
+	// SellerIDs 是允许的 seller_id 集合（逗号分隔）；为空表示不校验该字段（配置缺失时降级）。
+	SellerIDs string `env:"ALIPAY_SELLER_IDS"`
+	// NotifyURL 是支付宝异步通知地址（必须是 HTTPS 且不带查询参数）；
+	// 为空时不向支付宝传该参数，系统降级为主动查询模式（契约 §6.7）。
+	NotifyURL string `env:"NOTIFY_URL"`
+	// Timeout 是单次网关调用超时。
+	Timeout time.Duration `env:"ALIPAY_HTTP_TIMEOUT" envDefault:"5s"`
+}
+
+// SellerIDList 把逗号分隔的 seller_id 白名单切分为切片，去掉空白项。
+func (c AlipayConfig) SellerIDList() []string {
+	if strings.TrimSpace(c.SellerIDs) == "" {
+		return nil
+	}
+	parts := strings.Split(c.SellerIDs, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
 }
 
 func Load() (Config, error) {
