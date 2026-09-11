@@ -66,6 +66,11 @@ func (h *RegistrationHandler) Eligibility(c *gin.Context) {
 
 // Create 处理 POST /api/v1/registrations：创建挂单与待支付信息（契约 §6.2）。
 // 必须携带 Idempotency-Key：重复 key 返回第一次结果，且不重复扣号/建单。
+//
+// 建单事务提交后会在同一个请求内完成支付宝预下单，201 响应因此携带 qrCode 与
+// payableUntil/validUntil；预下单或二维码回写失败时订单已整单补偿，返回 502
+// PAYMENT_PROVIDER_UNAVAILABLE 且不含二维码。5xx 不入幂等存储，客户端可用同一 key 重试，
+// 重试会以新的 out_trade_no 重新建单。
 func (h *RegistrationHandler) Create(c *gin.Context) {
 	actor, ok := h.actor(c)
 	if !ok {
@@ -99,8 +104,8 @@ func (h *RegistrationHandler) Create(c *gin.Context) {
 		}
 		return &opResult{
 			status:  http.StatusCreated,
-			headers: map[string]string{"Location": registrationLocation(created.ID)},
-			body:    response.NewRegistrationResource(*created),
+			headers: map[string]string{"Location": registrationLocation(created.Registration.ID)},
+			body:    response.NewRegistrationResource(created.Registration, created.Payment),
 		}
 	})
 }
@@ -284,7 +289,8 @@ func registrationStatus(code string) int {
 		return http.StatusNotFound
 	case registrationservice.CodeSlotSoldOut, registrationservice.CodeDuplicate:
 		return http.StatusConflict
-	case registrationservice.CodeDependencyUnavailable:
+	case registrationservice.CodeDependencyUnavailable,
+		registrationservice.CodePaymentProviderUnavailable:
 		return http.StatusBadGateway
 	default:
 		return http.StatusInternalServerError

@@ -91,20 +91,29 @@ type fakePaymentRepository struct {
 	// 读取结果：订单与故障注入。
 	item    *domainpayment.Payment
 	findErr error
+	// outTradeNoErr 只让「按交易号读取」失败（nil 表示不注入）：
+	// 用于覆盖 CreateOrder 在预下单后重读最新状态时的 404/502 分支，
+	// 此时按挂号编号的首次读取必须仍然成功。
+	outTradeNoErr error
 	// latestItem 是条件更新未生效时重读返回的最新状态（nil 表示沿用 item）。
 	latestItem *domainpayment.Payment
 	// outTradeNoItem 是按交易号读取的专属返回（nil 表示沿用 item）。
 	// 用于区分「按挂号编号读取的初始值」与「按交易号回读的值」：预下单并发竞争时，
 	// 初始读取还没有二维码，但回读必须能得到并发请求已写入的那个二维码。
+	// 注意：注入 latestItem 时，第二次及之后的读取优先返回 latestItem（重读语义），
+	// outTradeNoItem 只覆盖首次读取。
 	outTradeNoItem *domainpayment.Payment
 	// 窗口补齐：返回值与故障注入。
 	ensureItem *domainpayment.Payment
 	ensureErr  error
 	// 回写与迁移：写入结果、故障与条件更新结果。
-	saveResult     bool
-	saveErr        error
-	markPaidResult bool
-	markPaidErr    error
+	saveResult bool
+	saveErr    error
+	// saveFailsBeforeOK 记录 SavePrepayID 在成功前先失败的次数，用于覆盖回写重试：
+	// 仅在计数归零后才按 saveResult/saveErr 正常返回。
+	saveFailsBeforeOK int
+	markPaidResult    bool
+	markPaidErr       error
 
 	// 调用记录。
 	regQueries  []findByRegistrationCall
@@ -161,16 +170,20 @@ func (r *fakePaymentRepository) FindPaymentByOutTradeNo(
 	ownerPatientID int64,
 ) (*domainpayment.Payment, error) {
 	r.outQueries = append(r.outQueries, findByOutTradeNoCall{outTradeNo, ownerPatientID})
+	if r.outTradeNoErr != nil {
+		return nil, r.outTradeNoErr
+	}
 	if r.findErr != nil {
 		return nil, r.findErr
+	}
+	// 第二次及之后的调用是「重读」：注入 latestItem 时优先返回最新状态。
+	// 这样 isNew=false 的幂等路径若误加重读，就会读到注入的终态而返回 409，用例能立刻发现。
+	if len(r.outQueries) > 1 && r.latestItem != nil {
+		return clonePayment(r.latestItem), nil
 	}
 	// 注入了「按交易号读取」的专属值时必须优先返回，供预下单回读分支断言使用。
 	if r.outTradeNoItem != nil {
 		return clonePayment(r.outTradeNoItem), nil
-	}
-	// 第二次调用是「条件更新未生效」后的重读，返回注入的最新状态。
-	if len(r.outQueries) > 1 && r.latestItem != nil {
-		return clonePayment(r.latestItem), nil
 	}
 	return clonePayment(r.item), nil
 }
@@ -188,8 +201,23 @@ func (r *fakePaymentRepository) EnsurePaymentWindow(_ context.Context, outTradeN
 
 // SavePrepayID 记录回写入参并返回注入的写入结果与故障。
 // saved=false 模拟「并发请求已先行写入二维码」，用于覆盖回读库中已有二维码的分支。
+//
+// saved=true 时同步更新内存订单的 prepay_id，模拟真实仓储「回写成功后按 out_trade_no
+// 能读到刚写入的二维码」的语义：CreateOrder 在 isNew=true 时会重读一次最新状态，
+// 假桩若不同步这次写入，重读就会拿到过时的无码订单。
 func (r *fakePaymentRepository) SavePrepayID(_ context.Context, outTradeNo string, prepayID string) (bool, error) {
 	r.saveCalls = append(r.saveCalls, savePrepayIDCall{outTradeNo, prepayID})
+	// 先消费注入的瞬时失败次数：用于断言 precreate 的回写有限重试（前 N 次失败后成功）。
+	if r.saveFailsBeforeOK > 0 {
+		r.saveFailsBeforeOK--
+		return false, errors.New("回写二维码瞬时失败")
+	}
+	if r.saveErr != nil {
+		return r.saveResult, r.saveErr
+	}
+	if r.saveResult && r.item != nil && r.item.OutTradeNo == outTradeNo {
+		r.item.PrepayID = prepayID
+	}
 	return r.saveResult, r.saveErr
 }
 
@@ -416,279 +444,22 @@ func TestReadPayableOwnershipSwitch(t *testing.T) {
 	}
 }
 
-// TestReadPayablePrecreatesWhenPrepayIDMissing 覆盖最小闭环：prepay_id 为空且在
-// pay_deadline 内时补做一次 alipay.trade.precreate，回写二维码并返回 payable=true。
-func TestReadPayablePrecreatesWhenPrepayIDMissing(t *testing.T) {
-	item := paymentTestUnpaid()
-	item.PrepayID = ""
-	const newQRCode = "https://qr.alipay.com/bax-new-precreate"
+// TestReadPayableIsPureRead ReadPayable 是纯读取（契约 §6.5）：即使 prepay_id 与支付窗口缺失，
+// 也不得调用支付宝、不得补写支付窗口、不得回写二维码；二维码与两个时间点由建单流程（§6.2）
+// 或创建支付订单接口（§6.9）负责写入，读路径只按 registrationId 回读，避免「先建单、
+// 稍后再取码」的降级路径让订单有效期与二维码有效期不同起点。
+func TestReadPayableIsPureRead(t *testing.T) {
+	t.Run("prepay_id 与时间点全空：只回读，不触达 provider 与仓储写操作", func(t *testing.T) {
+		item := paymentTestUnpaid()
+		item.PrepayID = ""
+		item.PrecreateAt = time.Time{}
+		item.PayDeadline = time.Time{}
+		item.ExpireAt = time.Time{}
 
-	repo := newFakePaymentRepository()
-	repo.item = item
-	gateway := &fakeAlipayGateway{
-		precreateResult: &domainpayment.PrecreateResult{QRCode: newQRCode},
-	}
-	service := newPaymentTestService(repo, gateway)
-
-	result, err := service.ReadPayable(context.Background(), paymentTestPatientActor(77), ReadInput{
-		RegistrationID: paymentTestRegistrationID,
-		Method:         PaymentMethodAlipay,
-	})
-	if err != nil {
-		t.Fatalf("prepay_id 为空时应补做预下单，实际报错 %v", err)
-	}
-	if len(repo.ensureCalls) != 1 || repo.ensureCalls[0] != paymentTestOutTradeNo {
-		t.Fatalf("补齐支付窗口调用 = %v，期望 [%s]", repo.ensureCalls, paymentTestOutTradeNo)
-	}
-	if len(gateway.precreateCalls) != 1 {
-		t.Fatalf("预下单调用次数 = %d，期望 1", len(gateway.precreateCalls))
-	}
-	wantReq := domainpayment.PrecreateRequest{
-		OutTradeNo:     paymentTestOutTradeNo,
-		Amount:         paymentTestAmount,
-		Subject:        paymentTestSubject,
-		TimeoutExpress: "30m",
-		NotifyURL:      paymentTestNotifyURL,
-	}
-	if gateway.precreateCalls[0] != wantReq {
-		t.Fatalf("预下单入参 = %+v，期望 %+v", gateway.precreateCalls[0], wantReq)
-	}
-	if len(repo.saveCalls) != 1 || repo.saveCalls[0] != (savePrepayIDCall{paymentTestOutTradeNo, newQRCode}) {
-		t.Fatalf("二维码回写入参 = %+v，期望 {%s %s}", repo.saveCalls, paymentTestOutTradeNo, newQRCode)
-	}
-	if !result.Payable {
-		t.Fatal("窗口内且预下单成功时 payable 应为 true")
-	}
-	if result.Payment.PrepayID != newQRCode {
-		t.Fatalf("返回的 prepay_id = %q，期望 %q", result.Payment.PrepayID, newQRCode)
-	}
-	if result.Payment.PaymentStatus != domainpayment.PaymentStatusUnpaid {
-		t.Fatalf("paymentStatus = %q，期望 %q", result.Payment.PaymentStatus, domainpayment.PaymentStatusUnpaid)
-	}
-}
-
-// TestReadPayableWindowAndStatusSkipPrecreate 覆盖不触发预下单的分支：
-// 已过 pay_deadline、已是终态、prepay_id 已存在等情况都不得调用 provider（契约 §6.5）。
-//
-// ensureItem 可选注入 EnsurePaymentWindow 的返回值，用于模拟「补窗口后读到的订单」；
-// 为 nil 时仓储沿用初始查询结果。wantPrepayID 非空时额外断言返回的 prepay_id，
-// 用于确认脏数据补窗口后回读的是库里已有二维码，而不是本次 provider 返回值。
-func TestReadPayableWindowAndStatusSkipPrecreate(t *testing.T) {
-	cases := []struct {
-		name            string
-		mutate          func(*domainpayment.Payment)
-		ensureItem      *domainpayment.Payment
-		wantPrepayID    string
-		wantEnsureCalls int
-		wantPayable     bool
-	}{
-		{
-			name: "prepay_id 为空且已过 pay_deadline：补窗口但不预下单",
-			mutate: func(item *domainpayment.Payment) {
-				item.PrepayID = ""
-				item.PayDeadline = paymentTestServiceNow.Add(-time.Minute)
-				item.ExpireAt = paymentTestServiceNow.Add(4 * time.Minute)
-			},
-			wantEnsureCalls: 1,
-			wantPayable:     false,
-		},
-		{
-			name: "prepay_id 已存在且已过 pay_deadline：不回写也不预下单",
-			mutate: func(item *domainpayment.Payment) {
-				item.PayDeadline = paymentTestServiceNow.Add(-time.Minute)
-				item.ExpireAt = paymentTestServiceNow.Add(4 * time.Minute)
-			},
-			wantEnsureCalls: 0,
-			wantPayable:     false,
-		},
-		{
-			name:            "prepay_id 已存在且在窗口内：直接回读",
-			mutate:          func(item *domainpayment.Payment) {},
-			wantEnsureCalls: 0,
-			wantPayable:     true,
-		},
-		{
-			name: "已 PAID 且 prepay_id 已存在：不回写也不预下单",
-			mutate: func(item *domainpayment.Payment) {
-				item.PaymentStatus = domainpayment.PaymentStatusPaid
-				item.TransactionID = paymentTestTradeNo
-			},
-			wantEnsureCalls: 0,
-			wantPayable:     false,
-		},
-		{
-			name: "已 PAID 但 prepay_id 为空（历史脏数据）：只补窗口，不预下单",
-			mutate: func(item *domainpayment.Payment) {
-				item.PaymentStatus = domainpayment.PaymentStatusPaid
-				item.PrepayID = ""
-			},
-			wantEnsureCalls: 1,
-			wantPayable:     false,
-		},
-		{
-			name: "已 EXPIRED：不回写也不预下单",
-			mutate: func(item *domainpayment.Payment) {
-				item.PaymentStatus = domainpayment.PaymentStatusExpired
-			},
-			wantEnsureCalls: 0,
-			wantPayable:     false,
-		},
-		{
-			name: "prepay_id 已存在但三个时间点为空（脏数据）：只补窗口、不重复预下单",
-			mutate: func(item *domainpayment.Payment) {
-				// 保留库里已有二维码，只清空三个时间点，模拟历史脏数据。
-				item.PrecreateAt = time.Time{}
-				item.PayDeadline = time.Time{}
-				item.ExpireAt = time.Time{}
-			},
-			// 补窗口后订单窗口完整，二维码仍是库里那个：应直接回读，不得重复预下单。
-			ensureItem:      paymentTestUnpaid(),
-			wantPrepayID:    paymentTestQRCode,
-			wantEnsureCalls: 1,
-			wantPayable:     true,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			item := paymentTestUnpaid()
-			tc.mutate(item)
-
-			repo := newFakePaymentRepository()
-			repo.item = item
-			repo.ensureItem = tc.ensureItem
-			gateway := &fakeAlipayGateway{
-				precreateResult: &domainpayment.PrecreateResult{QRCode: "https://qr.alipay.com/bax-should-not-happen"},
-			}
-			service := newPaymentTestService(repo, gateway)
-
-			result, err := service.ReadPayable(context.Background(), paymentTestMisActor(), ReadInput{
-				RegistrationID: paymentTestRegistrationID,
-				Method:         PaymentMethodAlipay,
-			})
-			if err != nil {
-				t.Fatalf("读取支付参数不应报错，实际 %v", err)
-			}
-			if len(gateway.precreateCalls) != 0 {
-				t.Fatalf("该分支不应调用预下单，实际调用 %d 次", len(gateway.precreateCalls))
-			}
-			if len(repo.saveCalls) != 0 {
-				t.Fatalf("该分支不应回写二维码，实际回写 %d 次", len(repo.saveCalls))
-			}
-			if len(repo.ensureCalls) != tc.wantEnsureCalls {
-				t.Fatalf("补齐支付窗口调用次数 = %d，期望 %d", len(repo.ensureCalls), tc.wantEnsureCalls)
-			}
-			if result.Payable != tc.wantPayable {
-				t.Fatalf("payable = %v，期望 %v", result.Payable, tc.wantPayable)
-			}
-			if result.Payment.PaymentStatus != item.PaymentStatus {
-				t.Fatalf("paymentStatus = %q，期望 %q", result.Payment.PaymentStatus, item.PaymentStatus)
-			}
-			if tc.wantPrepayID != "" && result.Payment.PrepayID != tc.wantPrepayID {
-				t.Fatalf("返回的 prepay_id = %q，期望 %q", result.Payment.PrepayID, tc.wantPrepayID)
-			}
-		})
-	}
-}
-
-// TestReadPayableProviderUnavailable 覆盖 provider 与回写异常：
-// 预下单失败、二维码为空与回写失败都必须返回错误，且绝不把二维码交付给客户端。
-func TestReadPayableProviderUnavailable(t *testing.T) {
-	t.Run("预下单返回服务不可用", func(t *testing.T) {
-		repo, gateway, service := newPrecreateFailureFixture()
-		gateway.precreateErr = port.ErrAlipayUnavailable
-
-		_, err := service.ReadPayable(context.Background(), paymentTestMisActor(), ReadInput{
-			RegistrationID: paymentTestRegistrationID,
-			Method:         PaymentMethodAlipay,
-		})
-		serviceErr := requireServiceError(t, err, CodeProviderUnavailable)
-		if serviceErr.Message != "支付渠道暂时不可用，请稍后重试" {
-			t.Fatalf("message = %q", serviceErr.Message)
-		}
-		if len(repo.saveCalls) != 0 {
-			t.Fatalf("预下单失败不应回写二维码，实际回写 %d 次", len(repo.saveCalls))
-		}
-	})
-
-	t.Run("预下单返回交易已关闭", func(t *testing.T) {
-		_, gateway, service := newPrecreateFailureFixture()
-		gateway.precreateErr = port.ErrAlipayTradeClosed
-
-		_, err := service.ReadPayable(context.Background(), paymentTestMisActor(), ReadInput{
-			RegistrationID: paymentTestRegistrationID,
-			Method:         PaymentMethodAlipay,
-		})
-		serviceErr := requireServiceError(t, err, CodeProviderUnavailable)
-		if !strings.Contains(serviceErr.Message, "不可支付") {
-			t.Fatalf("message = %q，期望包含「不可支付」", serviceErr.Message)
-		}
-	})
-
-	t.Run("预下单返回空二维码", func(t *testing.T) {
-		repo, gateway, service := newPrecreateFailureFixture()
-		gateway.precreateResult = &domainpayment.PrecreateResult{QRCode: "   "}
-
-		_, err := service.ReadPayable(context.Background(), paymentTestMisActor(), ReadInput{
-			RegistrationID: paymentTestRegistrationID,
-			Method:         PaymentMethodAlipay,
-		})
-		requireServiceError(t, err, CodeProviderUnavailable)
-		if len(repo.saveCalls) != 0 {
-			t.Fatalf("空二维码不应回写，实际回写 %d 次", len(repo.saveCalls))
-		}
-	})
-
-	t.Run("二维码回写失败", func(t *testing.T) {
-		repo, gateway, service := newPrecreateFailureFixture()
-		repo.saveErr = errors.New("update 失败")
-
-		_, err := service.ReadPayable(context.Background(), paymentTestMisActor(), ReadInput{
-			RegistrationID: paymentTestRegistrationID,
-			Method:         PaymentMethodAlipay,
-		})
-		requireErrIs(t, err, ErrDependencyUnavailable)
-		if len(gateway.precreateCalls) != 1 {
-			t.Fatalf("预下单调用次数 = %d，期望 1", len(gateway.precreateCalls))
-		}
-		if len(repo.saveCalls) != 1 {
-			t.Fatalf("二维码回写次数 = %d，期望 1", len(repo.saveCalls))
-		}
-	})
-}
-
-// newPrecreateFailureFixture 构造「prepay_id 为空且在窗口内」的固定装置，
-// 供预下单失败的四个子用例复用。
-func newPrecreateFailureFixture() (*fakePaymentRepository, *fakeAlipayGateway, *Service) {
-	item := paymentTestUnpaid()
-	item.PrepayID = ""
-	repo := newFakePaymentRepository()
-	repo.item = item
-	gateway := &fakeAlipayGateway{
-		precreateResult: &domainpayment.PrecreateResult{QRCode: paymentTestQRCode},
-	}
-	return repo, gateway, newPaymentTestService(repo, gateway)
-}
-
-// TestReadPayablePrepayIDWriteRace 覆盖预下单二维码回写的并发分支（契约 §6.5、§6.2 第 3.2 节）：
-// SavePrepayID 返回 saved=false 表示并发请求已先行写入，此时响应必须回显库中已有的二维码，
-// 而不是本次 provider 新返回的值；库中也没有二维码时只能返回 502，绝不把内存值交付给客户端；
-// 二维码超过 prepay_id 列宽（64）时必须在回写前拦截，避免数据库报错冒泡成不可解释的 502。
-func TestReadPayablePrepayIDWriteRace(t *testing.T) {
-	const (
-		providerQRCode = "https://qr.alipay.com/bax-provider-new"
-		storedQRCode   = "qr-old"
-	)
-
-	t.Run("并发请求已写入：响应回显库中二维码而非本次 provider 值", func(t *testing.T) {
 		repo := newFakePaymentRepository()
-		repo.item = paymentTestUnpaid()
-		repo.item.PrepayID = ""
-		// 回读时库中已有并发请求写入的二维码，且与本次 provider 返回值不同。
-		repo.outTradeNoItem = paymentTestUnpaid()
-		repo.outTradeNoItem.PrepayID = storedQRCode
-		repo.saveResult = false
+		repo.item = item
 		gateway := &fakeAlipayGateway{
-			precreateResult: &domainpayment.PrecreateResult{QRCode: providerQRCode},
+			precreateResult: &domainpayment.PrecreateResult{QRCode: "https://qr.alipay.com/bax-should-not-happen"},
 		}
 		service := newPaymentTestService(repo, gateway)
 
@@ -697,60 +468,47 @@ func TestReadPayablePrepayIDWriteRace(t *testing.T) {
 			Method:         PaymentMethodAlipay,
 		})
 		if err != nil {
-			t.Fatalf("并发写入场景不应报错，实际 %v", err)
+			t.Fatalf("纯读取不应报错，实际 %v", err)
 		}
-		if len(repo.saveCalls) != 1 || repo.saveCalls[0].prepayID != providerQRCode {
-			t.Fatalf("回写入参 = %+v，期望尝试写入本次 provider 二维码 %q", repo.saveCalls, providerQRCode)
+		if len(repo.ensureCalls) != 0 {
+			t.Errorf("读路径不得补写支付窗口，EnsurePaymentWindow 调用 %d 次", len(repo.ensureCalls))
 		}
-		if len(repo.outQueries) != 1 {
-			t.Fatalf("回读库中二维码的次数 = %d，期望 1", len(repo.outQueries))
+		if len(gateway.precreateCalls) != 0 {
+			t.Errorf("读路径不得调用支付宝，Precreate 调用 %d 次", len(gateway.precreateCalls))
 		}
-		if result.Payment.PrepayID != storedQRCode {
-			t.Fatalf("响应 prepay_id = %q，期望库中已有二维码 %q（不得回显本次 provider 值 %q）",
-				result.Payment.PrepayID, storedQRCode, providerQRCode)
-		}
-	})
-
-	t.Run("并发写入未生效且库中为空：返回 502", func(t *testing.T) {
-		repo := newFakePaymentRepository()
-		repo.item = paymentTestUnpaid()
-		repo.item.PrepayID = ""
-		// 回读到的二维码仍为空：库中没有可用二维码。
-		repo.outTradeNoItem = paymentTestUnpaid()
-		repo.outTradeNoItem.PrepayID = ""
-		repo.saveResult = false
-		gateway := &fakeAlipayGateway{
-			precreateResult: &domainpayment.PrecreateResult{QRCode: providerQRCode},
-		}
-		service := newPaymentTestService(repo, gateway)
-
-		_, err := service.ReadPayable(context.Background(), paymentTestMisActor(), ReadInput{
-			RegistrationID: paymentTestRegistrationID,
-			Method:         PaymentMethodAlipay,
-		})
-		requireServiceError(t, err, CodeProviderUnavailable)
-		if len(repo.outQueries) != 1 {
-			t.Fatalf("回读库中二维码的次数 = %d，期望 1", len(repo.outQueries))
-		}
-	})
-
-	t.Run("二维码超过列宽：502 且不回写", func(t *testing.T) {
-		repo := newFakePaymentRepository()
-		repo.item = paymentTestUnpaid()
-		repo.item.PrepayID = ""
-		gateway := &fakeAlipayGateway{
-			// prepay_id 列宽为 64，65 个字符必然写不进去，必须在回写前拦截。
-			precreateResult: &domainpayment.PrecreateResult{QRCode: strings.Repeat("q", 65)},
-		}
-		service := newPaymentTestService(repo, gateway)
-
-		_, err := service.ReadPayable(context.Background(), paymentTestMisActor(), ReadInput{
-			RegistrationID: paymentTestRegistrationID,
-			Method:         PaymentMethodAlipay,
-		})
-		requireServiceError(t, err, CodeProviderUnavailable)
 		if len(repo.saveCalls) != 0 {
-			t.Fatalf("超长二维码不得回写，实际回写 %d 次", len(repo.saveCalls))
+			t.Errorf("读路径不得回写二维码，SavePrepayID 调用 %d 次", len(repo.saveCalls))
+		}
+		if result.Payment.PrepayID != "" {
+			t.Errorf("prepay_id = %q，want 空（库中没有二维码时按原样返回）", result.Payment.PrepayID)
+		}
+		if result.Payable {
+			t.Error("支付时间点缺失时 payable 应为 false")
+		}
+	})
+
+	t.Run("窗口完整且二维码存在：回读并给出 payable", func(t *testing.T) {
+		repo := newFakePaymentRepository()
+		repo.item = paymentTestUnpaid()
+		gateway := &fakeAlipayGateway{}
+		service := newPaymentTestService(repo, gateway)
+
+		result, err := service.ReadPayable(context.Background(), paymentTestPatientActor(77), ReadInput{
+			RegistrationID: paymentTestRegistrationID,
+			Method:         PaymentMethodAlipay,
+		})
+		if err != nil {
+			t.Fatalf("读取支付参数不应报错，实际 %v", err)
+		}
+		if !result.Payable {
+			t.Error("窗口内 UNPAID 订单 payable 应为 true")
+		}
+		if result.Payment.PrepayID != paymentTestQRCode {
+			t.Errorf("prepay_id = %q，want %q", result.Payment.PrepayID, paymentTestQRCode)
+		}
+		if len(repo.ensureCalls) != 0 || len(gateway.precreateCalls) != 0 || len(repo.saveCalls) != 0 {
+			t.Errorf("读路径不得产生任何写或 provider 调用：ensure=%d precreate=%d save=%d",
+				len(repo.ensureCalls), len(gateway.precreateCalls), len(repo.saveCalls))
 		}
 	})
 }

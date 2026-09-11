@@ -124,6 +124,11 @@ type Registration struct {
 	OutTradeNo      string
 	PaymentStatus   string
 	CreateDate      string
+	// PayDeadline 与 ExpireAt 是支付窗口的两个截止时刻（medical_registration.pay_deadline /
+	// expire_at），由建单事务内的数据库 now() 写定。列表用它展示倒计时与 30~35 分钟的
+	// 「支付确认中」（契约 §6.3）；历史数据可能为零值，此时对外序列化为空串。
+	PayDeadline time.Time
+	ExpireAt    time.Time
 }
 
 // ScheduleSnapshot 是资格校验与建单所需的排班快照：
@@ -253,6 +258,11 @@ var (
 	ErrDuplicate            = errors.New("registration already occupies the schedule for this pid")
 	ErrRegistrationNotFound = errors.New("registration not found")
 )
+
+// ErrCompensationRefused 表示建单失败后的整单补偿被拒绝：挂号记录仍存在，但已不是未付款
+// 状态。删除它可能抹掉一笔已收款的订单，因此补偿路径必须放弃删除与号源回退，由调用方告警
+// 并人工介入（契约 §6.2、创建订单与支付业务说明.md 第 3.3 节）。
+var ErrCompensationRefused = errors.New("registration compensation refused: order is no longer unpaid")
 
 // SlotSoldOutError 表示号源不足，携带 scheduleId 与实时余量供 409 响应 details 使用
 // （契约 §12.4 的 details 为 { scheduleId, remaining }）。

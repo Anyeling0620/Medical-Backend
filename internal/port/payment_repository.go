@@ -23,9 +23,8 @@ type PaymentRepository interface {
 	// EnsurePaymentWindow 幂等补齐支付窗口：三个时间点为空时用数据库 now() 一次性写入
 	// precreate_at、pay_deadline（+30 分钟）、expire_at（+35 分钟），并返回补齐后的支付信息。
 	//
-	// 这是最小闭环阶段的过渡实现：建单流程（契约 §6.2）尚未写入这三个字段，
-	// 首次取支付参数时补齐可让支付窗口与契约 §6.8 的语义保持一致；
-	// 建单流程接入后本方法不再产生写入（三个时间点已由建单 INSERT 写定）。
+	// 建单流程（契约 §6.2）已在建单 INSERT 内由数据库 now() 写定这三个字段，因此新建订单
+	// 不会走补写分支；本方法只用于创建支付订单接口（契约 §6.9）补齐历史订单的支付窗口。
 	// 只对仍为「未付款」的订单补齐，避免在已 PAID/EXPIRED/REFUNDED 的行上生成新的支付窗口。
 	// 订单不存在返回 payment.ErrPaymentNotFound。
 	EnsurePaymentWindow(ctx context.Context, outTradeNo string) (*payment.Payment, error)

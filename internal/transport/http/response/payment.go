@@ -1,6 +1,7 @@
 package response
 
 import (
+	"strings"
 	"time"
 
 	domainpayment "Medical-Web-Backend/internal/domain/payment"
@@ -26,9 +27,17 @@ type PaymentReadResponse struct {
 	ValidUntil     string `json:"validUntil"`
 }
 
-// NewPaymentReadResponse 把支付信息投影为取支付参数响应。
-// 二维码只在可支付时回显：已支付、已过期与 30~35 分钟窗口都不返回二维码。
+// NewPaymentReadResponse 把支付信息投影为取支付参数响应（取支付参数 §6.5 与创建支付订单
+// §6.9 共用）。
+//
+// 二维码只在可支付时回显：已支付、已过期与 30~35 分钟窗口都不返回二维码。此外 payable
+// 还要求二维码确实已落库：窗口存在但 prepay_id 为空（例如 §6.9 补齐窗口后预下单失败留下的行）
+// 时不得声明「可支付」，否则会出现 payable=true 却没有任何二维码可渲染的矛盾响应——
+// 契约 §6.5 规定 payable=true 时响应必须含 qrCode。
 func NewPaymentReadResponse(item domainpayment.Payment, payable bool) PaymentReadResponse {
+	if strings.TrimSpace(item.PrepayID) == "" {
+		payable = false
+	}
 	result := PaymentReadResponse{
 		OutTradeNo:     item.OutTradeNo,
 		RegistrationID: item.RegistrationID,

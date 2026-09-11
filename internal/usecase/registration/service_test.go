@@ -14,6 +14,7 @@ import (
 
 	domainauth "Medical-Web-Backend/internal/domain/auth"
 	"Medical-Web-Backend/internal/domain/patient"
+	domainpayment "Medical-Web-Backend/internal/domain/payment"
 	domainregistration "Medical-Web-Backend/internal/domain/registration"
 	"Medical-Web-Backend/internal/port"
 )
@@ -31,6 +32,8 @@ const (
 	registrationTestTradeNo = "20260910090000abcdef123456"
 	// registrationTestAmount 是排班快照给出的应付金额。
 	registrationTestAmount = "80.00"
+	// registrationTestQRCode 是假预下单桩返回并"已落库"的二维码。
+	registrationTestQRCode = "https://qr.alipay.com/bax-registration-test"
 )
 
 // registrationTestNow 是注入 Service 的固定业务时刻：业务时区（UTC+8）2026-09-10 09:00。
@@ -53,6 +56,9 @@ type registrationFakeRepo struct {
 	detail       *domainregistration.Detail
 	detailErr    error
 
+	// compensateErr 注入整单补偿失败，用于断言「补偿失败仍返回 502」。
+	compensateErr error
+
 	// 调用记录。
 	snapshotCalls          int
 	lastSnapshotID         int64
@@ -69,6 +75,9 @@ type registrationFakeRepo struct {
 	detailCalls            int
 	lastDetailID           int64
 	lastOwnerPatientID     int64
+
+	compensateCalls  int
+	lastCompensateID int64
 }
 
 func (r *registrationFakeRepo) FindScheduleSnapshot(
@@ -130,6 +139,16 @@ func (r *registrationFakeRepo) CreateRegistration(
 		PaymentStatus:   domainregistration.PaymentStatusUnpaid,
 		CreateDate:      "2026-09-10",
 	}, nil
+}
+
+// CompensateRegistration 记录补偿入参并返回注入的故障，供建单预下单失败用例断言。
+func (r *registrationFakeRepo) CompensateRegistration(
+	_ context.Context,
+	registrationID int64,
+) error {
+	r.compensateCalls++
+	r.lastCompensateID = registrationID
+	return r.compensateErr
 }
 
 func (r *registrationFakeRepo) ListRegistrations(
@@ -224,12 +243,48 @@ func (r *registrationFakePatients) FindPatientByID(_ context.Context, patientID 
 	return &copied, nil
 }
 
-// registrationTestEnv 汇总被测 Service 与三个内存桩。
+// registrationFakePrecreator 是内存版 port.PaymentPrecreator 桩：
+// 记录调用次数与挂号编号，并可按需注入返回值或故障。
+type registrationFakePrecreator struct {
+	payment *domainpayment.Payment
+	err     error
+
+	calls            int
+	lastRegistration int64
+}
+
+func (p *registrationFakePrecreator) PrecreateForOrder(
+	_ context.Context,
+	registrationID int64,
+) (*domainpayment.Payment, error) {
+	p.calls++
+	p.lastRegistration = registrationID
+	if p.err != nil {
+		return nil, p.err
+	}
+	if p.payment != nil {
+		copied := *p.payment
+		return &copied, nil
+	}
+	return &domainpayment.Payment{
+		RegistrationID: registrationID,
+		OutTradeNo:     registrationTestTradeNo,
+		Amount:         registrationTestAmount,
+		PaymentStatus:  domainpayment.PaymentStatusUnpaid,
+		PrepayID:       registrationTestQRCode,
+		PrecreateAt:    registrationTestNow,
+		PayDeadline:    registrationTestNow.Add(30 * time.Minute),
+		ExpireAt:       registrationTestNow.Add(35 * time.Minute),
+	}, nil
+}
+
+// registrationTestEnv 汇总被测 Service 与四个内存桩（仓储、就诊卡、患者、预下单）。
 type registrationTestEnv struct {
-	service  *Service
-	repo     *registrationFakeRepo
-	cards    *registrationFakeCards
-	patients *registrationFakePatients
+	service    *Service
+	repo       *registrationFakeRepo
+	cards      *registrationFakeCards
+	patients   *registrationFakePatients
+	precreator *registrationFakePrecreator
 }
 
 // completeCard 返回资料完整、属于 registrationTestPatientID 的就诊卡。
@@ -268,8 +323,18 @@ func completeSnapshot() domainregistration.ScheduleSnapshot {
 	}
 }
 
-// newRegistrationTestEnv 构造被测环境：固定业务时刻与固定外部交易号。
+// newRegistrationTestEnv 构造被测环境：固定业务时刻、固定外部交易号与默认成功的预下单桩。
 func newRegistrationTestEnv(t *testing.T) *registrationTestEnv {
+	t.Helper()
+	return newRegistrationTestEnvWithPrecreator(t, &registrationFakePrecreator{})
+}
+
+// newRegistrationTestEnvWithPrecreator 允许注入预下单桩（nil 表示装配缺失），
+// 用于验证建单流程对预下单能力的依赖。
+func newRegistrationTestEnvWithPrecreator(
+	t *testing.T,
+	precreator *registrationFakePrecreator,
+) *registrationTestEnv {
 	t.Helper()
 
 	card := completeCard()
@@ -288,9 +353,19 @@ func newRegistrationTestEnv(t *testing.T) *registrationTestEnv {
 		},
 	}
 
-	service := NewService(repo, cards, patients, func() time.Time { return registrationTestNow })
+	var hook port.PaymentPrecreator
+	if precreator != nil {
+		hook = precreator
+	}
+	service := NewService(repo, cards, patients, hook, func() time.Time { return registrationTestNow })
 	service.newTradeNo = func(time.Time) string { return registrationTestTradeNo }
-	return &registrationTestEnv{service: service, repo: repo, cards: cards, patients: patients}
+	return &registrationTestEnv{
+		service:    service,
+		repo:       repo,
+		cards:      cards,
+		patients:   patients,
+		precreator: precreator,
+	}
 }
 
 // patientActor 返回 realm=patient 的调用者（患者端主体固定为令牌中的当前患者）。
@@ -563,7 +638,7 @@ func int64Ptr(value int64) *int64 { return &value }
 const validPaymentMethod = PaymentMethodAlipay
 
 // TestCreateSuccess 建单成功：服务端从快照推导关联与金额，交易号由服务端生成，
-// 客户端只能提交就诊卡与时段（契约 §6.2）。
+// 客户端只能提交就诊卡与时段（契约 §6.2）；建单事务提交后在同一请求内完成预下单并回传支付参数。
 func TestCreateSuccess(t *testing.T) {
 	env := newRegistrationTestEnv(t)
 
@@ -578,24 +653,43 @@ func TestCreateSuccess(t *testing.T) {
 	if created == nil {
 		t.Fatal("created 不得为 nil")
 	}
-	if created.ID != 1001 {
-		t.Errorf("id = %d, want 1001", created.ID)
+	if created.Registration.ID != 1001 {
+		t.Errorf("id = %d, want 1001", created.Registration.ID)
 	}
-	if created.PatientCardID != registrationTestCardID {
-		t.Errorf("patientCardId = %d, want %d", created.PatientCardID, registrationTestCardID)
+	if created.Registration.PatientCardID != registrationTestCardID {
+		t.Errorf("patientCardId = %d, want %d", created.Registration.PatientCardID, registrationTestCardID)
 	}
-	if created.ScheduleID != registrationTestScheduleID {
-		t.Errorf("scheduleId = %d, want %d", created.ScheduleID, registrationTestScheduleID)
+	if created.Registration.ScheduleID != registrationTestScheduleID {
+		t.Errorf("scheduleId = %d, want %d", created.Registration.ScheduleID, registrationTestScheduleID)
 	}
-	if created.PaymentStatus != domainregistration.PaymentStatusUnpaid {
+	if created.Registration.PaymentStatus != domainregistration.PaymentStatusUnpaid {
 		t.Errorf("paymentStatus = %q, want %q（插入时固定为未付款）",
-			created.PaymentStatus, domainregistration.PaymentStatusUnpaid)
+			created.Registration.PaymentStatus, domainregistration.PaymentStatusUnpaid)
 	}
-	if created.OutTradeNo != registrationTestTradeNo {
-		t.Errorf("outTradeNo = %q, want 服务端生成的 %q", created.OutTradeNo, registrationTestTradeNo)
+	if created.Registration.OutTradeNo != registrationTestTradeNo {
+		t.Errorf("outTradeNo = %q, want 服务端生成的 %q", created.Registration.OutTradeNo, registrationTestTradeNo)
 	}
-	if err := domainregistration.ValidateOutTradeNo(created.OutTradeNo); err != nil {
+	if err := domainregistration.ValidateOutTradeNo(created.Registration.OutTradeNo); err != nil {
 		t.Errorf("生成的交易号不可落库：%v", err)
+	}
+	// 预下单恰好调用一次，且传入刚建好的挂号编号；返回的二维码与两个时间点原样透传。
+	if env.precreator.calls != 1 || env.precreator.lastRegistration != created.Registration.ID {
+		t.Errorf("预下单调用 %d 次（registrationId=%d），want 1 次（registrationId=%d）",
+			env.precreator.calls, env.precreator.lastRegistration, created.Registration.ID)
+	}
+	if created.Payment.PrepayID != registrationTestQRCode {
+		t.Errorf("payment.prepayId = %q, want %q", created.Payment.PrepayID, registrationTestQRCode)
+	}
+	if !created.Payment.PayDeadline.Equal(registrationTestNow.Add(30 * time.Minute)) {
+		t.Errorf("payment.payDeadline = %s, want %s",
+			created.Payment.PayDeadline, registrationTestNow.Add(30*time.Minute))
+	}
+	if !created.Payment.ExpireAt.Equal(registrationTestNow.Add(35 * time.Minute)) {
+		t.Errorf("payment.expireAt = %s, want %s",
+			created.Payment.ExpireAt, registrationTestNow.Add(35*time.Minute))
+	}
+	if env.repo.compensateCalls != 0 {
+		t.Errorf("成功路径不得补偿，CompensateRegistration 调用 %d 次", env.repo.compensateCalls)
 	}
 	if env.repo.createCalls != 1 {
 		t.Errorf("CreateRegistration 调用次数 = %d, want 1", env.repo.createCalls)
@@ -625,8 +719,8 @@ func TestCreateDerivesCardForPatientAccount(t *testing.T) {
 		if env.cards.findByPatientIDCalls != 1 {
 			t.Errorf("FindCardByPatientID 调用次数 = %d, want 1", env.cards.findByPatientIDCalls)
 		}
-		if created.PatientCardID != registrationTestCardID {
-			t.Errorf("patientCardId = %d, want 推导出的 %d", created.PatientCardID, registrationTestCardID)
+		if created.Registration.PatientCardID != registrationTestCardID {
+			t.Errorf("patientCardId = %d, want 推导出的 %d", created.Registration.PatientCardID, registrationTestCardID)
 		}
 	})
 
@@ -775,6 +869,9 @@ func TestCreateRejections(t *testing.T) {
 			if env.repo.createCalls != 0 {
 				t.Errorf("前置校验失败不得建单，CreateRegistration 调用 %d 次", env.repo.createCalls)
 			}
+			if env.precreator.calls != 0 {
+				t.Errorf("前置校验失败不得预下单，PrecreateForOrder 调用 %d 次", env.precreator.calls)
+			}
 		})
 	}
 }
@@ -909,8 +1006,8 @@ func TestCreatePaymentMethodContract(t *testing.T) {
 			t.Errorf("ALIPAY 建单应落库一次，created=%+v createCalls=%d", created, env.repo.createCalls)
 		}
 		// §12.4 样例的 patientCardId=10 / scheduleId=12 与测试常量一致，逐字段核对。
-		if created != nil && (created.PatientCardID != registrationTestCardID ||
-			created.ScheduleID != registrationTestScheduleID) {
+		if created != nil && (created.Registration.PatientCardID != registrationTestCardID ||
+			created.Registration.ScheduleID != registrationTestScheduleID) {
 			t.Errorf("建单结果与 §12.4 样例不一致：%+v", created)
 		}
 	})
@@ -1004,6 +1101,143 @@ func TestCreatePaymentMethodContract(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestCreatePrecreateFailureCompensates 覆盖「建单即预下单」失败时的整单补偿（契约 §6.2、
+// 业务说明第 3.3 节）：预下单失败必须撤销已占用号源并返回 502 PAYMENT_PROVIDER_UNAVAILABLE，
+// 且不返回任何挂号结果；补偿失败也必须对外保持同一错误，由日志告警人工介入。
+func TestCreatePrecreateFailureCompensates(t *testing.T) {
+	t.Run("预下单失败：补偿一次并返回 502", func(t *testing.T) {
+		env := newRegistrationTestEnv(t)
+		env.precreator.err = errors.New("alipay precreate down")
+
+		created, err := env.service.Create(context.Background(), patientActor(), CreateInput{
+			PatientCardID: int64Ptr(registrationTestCardID),
+			ScheduleID:    registrationTestScheduleID,
+			PaymentMethod: validPaymentMethod,
+		})
+		if created != nil {
+			t.Errorf("预下单失败不得返回建单结果：%+v", created)
+		}
+		assertServiceError(t, err, CodePaymentProviderUnavailable)
+		if env.repo.createCalls != 1 {
+			t.Errorf("CreateRegistration 调用 %d 次，want 1", env.repo.createCalls)
+		}
+		if env.precreator.calls != 1 {
+			t.Errorf("预下单调用 %d 次，want 1", env.precreator.calls)
+		}
+		if env.repo.compensateCalls != 1 || env.repo.lastCompensateID != 1001 {
+			t.Errorf("补偿调用 %d 次（registrationId=%d），want 1 次（registrationId=1001）",
+				env.repo.compensateCalls, env.repo.lastCompensateID)
+		}
+	})
+
+	t.Run("补偿失败：仍返回 502", func(t *testing.T) {
+		env := newRegistrationTestEnv(t)
+		env.precreator.err = errors.New("alipay precreate down")
+		env.repo.compensateErr = errors.New("compensate down")
+
+		created, err := env.service.Create(context.Background(), patientActor(), CreateInput{
+			PatientCardID: int64Ptr(registrationTestCardID),
+			ScheduleID:    registrationTestScheduleID,
+			PaymentMethod: validPaymentMethod,
+		})
+		if created != nil {
+			t.Errorf("补偿失败也不得返回建单结果：%+v", created)
+		}
+		assertServiceError(t, err, CodePaymentProviderUnavailable)
+		if env.repo.compensateCalls != 1 || env.repo.lastCompensateID != 1001 {
+			t.Errorf("补偿调用 %d 次（registrationId=%d），want 1 次（registrationId=1001）",
+				env.repo.compensateCalls, env.repo.lastCompensateID)
+		}
+	})
+
+	t.Run("预下单返回空二维码：补偿并返回 502", func(t *testing.T) {
+		env := newRegistrationTestEnv(t)
+		env.precreator.payment = &domainpayment.Payment{
+			RegistrationID: 1001,
+			OutTradeNo:     registrationTestTradeNo,
+			PaymentStatus:  domainpayment.PaymentStatusUnpaid,
+			PrepayID:       "   ",
+			PayDeadline:    registrationTestNow.Add(30 * time.Minute),
+			ExpireAt:       registrationTestNow.Add(35 * time.Minute),
+		}
+
+		created, err := env.service.Create(context.Background(), patientActor(), CreateInput{
+			PatientCardID: int64Ptr(registrationTestCardID),
+			ScheduleID:    registrationTestScheduleID,
+			PaymentMethod: validPaymentMethod,
+		})
+		if created != nil {
+			t.Errorf("空二维码不得当作成功返回：%+v", created)
+		}
+		assertServiceError(t, err, CodePaymentProviderUnavailable)
+		if env.repo.compensateCalls != 1 {
+			t.Errorf("空二维码必须补偿一次，实际 %d 次", env.repo.compensateCalls)
+		}
+	})
+}
+
+// TestCreateWithoutPrecreatorFailsBeforeBooking 装配缺失（precreator=nil）属于配置错误：
+// 必须在建单前拒绝，返回 502 PAYMENT_PROVIDER_UNAVAILABLE，不占用号源也不调用仓储建单。
+func TestCreateWithoutPrecreatorFailsBeforeBooking(t *testing.T) {
+	env := newRegistrationTestEnvWithPrecreator(t, nil)
+
+	created, err := env.service.Create(context.Background(), patientActor(), CreateInput{
+		PatientCardID: int64Ptr(registrationTestCardID),
+		ScheduleID:    registrationTestScheduleID,
+		PaymentMethod: validPaymentMethod,
+	})
+	if created != nil {
+		t.Errorf("装配缺失不得返回建单结果：%+v", created)
+	}
+	assertServiceError(t, err, CodePaymentProviderUnavailable)
+	if env.repo.createCalls != 0 || env.repo.compensateCalls != 0 {
+		t.Errorf("装配缺失不得建单或补偿：create=%d compensate=%d",
+			env.repo.createCalls, env.repo.compensateCalls)
+	}
+	if env.cards.findByIDCalls != 0 {
+		t.Errorf("装配缺失应在取卡前拒绝，FindCardByID 调用 %d 次", env.cards.findByIDCalls)
+	}
+}
+
+// TestCreateValidationSkipsPrecreate 非法入参必须优先 422，且不得触达预下单（契约 §6.2）。
+func TestCreateValidationSkipsPrecreate(t *testing.T) {
+	cases := []struct {
+		name  string
+		input CreateInput
+	}{
+		{
+			name: "scheduleId 非正整数",
+			input: CreateInput{
+				PatientCardID: int64Ptr(registrationTestCardID),
+				ScheduleID:    0,
+				PaymentMethod: validPaymentMethod,
+			},
+		},
+		{
+			name: "paymentMethod 非 ALIPAY",
+			input: CreateInput{
+				PatientCardID: int64Ptr(registrationTestCardID),
+				ScheduleID:    registrationTestScheduleID,
+				PaymentMethod: "WECHAT",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newRegistrationTestEnv(t)
+
+			_, err := env.service.Create(context.Background(), patientActor(), tc.input)
+			assertServiceError(t, err, CodeValidationFailed)
+			if env.precreator.calls != 0 {
+				t.Errorf("非法入参不得预下单，PrecreateForOrder 调用 %d 次", env.precreator.calls)
+			}
+			if env.repo.createCalls != 0 {
+				t.Errorf("非法入参不得建单，CreateRegistration 调用 %d 次", env.repo.createCalls)
+			}
+		})
+	}
 }
 
 // TestListPatientOwnershipFilter 患者端强制归属过滤：ownerPatientID 必须写进筛选条件，
@@ -1225,7 +1459,8 @@ func TestDetailNotFoundAndFailure(t *testing.T) {
 // 不能伪装成业务错误码（否则客户端会得到误导性的 404/409）。
 func TestServiceRequiresDependencies(t *testing.T) {
 	env := newRegistrationTestEnv(t)
-	service := NewService(nil, env.cards, env.patients, func() time.Time { return registrationTestNow })
+	service := NewService(nil, env.cards, env.patients, &registrationFakePrecreator{},
+		func() time.Time { return registrationTestNow })
 
 	_, err := service.Create(context.Background(), patientActor(), CreateInput{
 		PatientCardID: int64Ptr(registrationTestCardID),

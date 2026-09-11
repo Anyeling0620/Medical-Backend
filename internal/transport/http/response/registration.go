@@ -1,14 +1,15 @@
 package response
 
 import (
+	domainpayment "Medical-Web-Backend/internal/domain/payment"
 	domainregistration "Medical-Web-Backend/internal/domain/registration"
 )
 
 // 本文件是挂号域（/api/v1/registrations*）的响应 DTO（契约 §6.1–§6.4、§12.4）。
 //
 // 显式定义而不直接序列化领域实体：契约对不同接口规定了不同的字段集合
-// （列表不含 workPlanId/scheduleId，详情含医生与容量摘要，prepayId 只在受保护的
-// 支付详情中返回），字段集合本身是契约的一部分。
+// （列表不含 workPlanId/scheduleId，详情含医生与容量摘要，二维码内容只在建单响应 §6.2 与
+// 取支付参数 §6.5 这两个受保护响应中返回），字段集合本身是契约的一部分。
 
 // EligibilityResponse 是资格校验响应（契约 §6.1、§12.4）。
 //
@@ -36,7 +37,13 @@ func NewEligibilityResponse(item domainregistration.Eligibility) EligibilityResp
 }
 
 // RegistrationResource 是创建挂号的响应体（契约 §6.2、§12.4）：含 workPlanId 与
-// scheduleId，便于前端在后续支付步骤中复用关联信息；prepayId 不在本响应中返回。
+// scheduleId，便于前端在后续支付步骤中复用关联信息；并回显建单时同一次请求内完成的预下单结果。
+//
+// qrCode 是预下单返回并已落库的付款二维码内容，端上据此渲染二维码；payableUntil 等于
+// pay_deadline（预下单基准 + 30 分钟），是前端倒计时与关闭支付入口的唯一依据；validUntil 等于
+// expire_at（预下单基准 + 35 分钟），是继续轮询到终态的兜底上限。三者来自同一条建单 INSERT
+// 写定的时间点，因此二维码与订单有效期同起点。预下单失败不会产生本响应（接口返回 502 且订单
+// 已整单补偿），所以成功响应中三者必然齐全。
 type RegistrationResource struct {
 	ID              int64  `json:"id"`
 	PatientCardID   int64  `json:"patientCardId"`
@@ -50,10 +57,16 @@ type RegistrationResource struct {
 	OutTradeNo      string `json:"outTradeNo"`
 	PaymentStatus   string `json:"paymentStatus"`
 	CreateDate      string `json:"createDate"`
+	PayableUntil    string `json:"payableUntil"`
+	ValidUntil      string `json:"validUntil"`
+	QRCode          string `json:"qrCode"`
 }
 
-// NewRegistrationResource 把挂号实体投影为创建成功的响应体。
-func NewRegistrationResource(item domainregistration.Registration) RegistrationResource {
+// NewRegistrationResource 把挂号实体与本次预下单的支付参数投影为创建成功的响应体。
+func NewRegistrationResource(
+	item domainregistration.Registration,
+	pay domainpayment.Payment,
+) RegistrationResource {
 	return RegistrationResource{
 		ID:              item.ID,
 		PatientCardID:   item.PatientCardID,
@@ -67,11 +80,18 @@ func NewRegistrationResource(item domainregistration.Registration) RegistrationR
 		OutTradeNo:      item.OutTradeNo,
 		PaymentStatus:   item.PaymentStatus,
 		CreateDate:      item.CreateDate,
+		PayableUntil:    formatPaymentTime(pay.PayDeadline),
+		ValidUntil:      formatPaymentTime(pay.ExpireAt),
+		QRCode:          pay.PrepayID,
 	}
 }
 
-// RegistrationItem 是挂号列表项（契约 §6.3、§12.4）：只含挂号自身字段，
-// 不返回 workPlanId/scheduleId/prepayId/transactionId。
+// RegistrationItem 是挂号列表项（契约 §6.3、§12.4）：只含挂号自身字段与支付窗口，
+// 不返回 workPlanId/scheduleId，也不返回 prepay_id/transaction_id——二维码内容只允许出现在
+// 建单响应（§6.2）与取支付参数（§6.5）这两个受保护响应里。
+//
+// payableUntil/validUntil 供列表展示倒计时与 30~35 分钟的「支付确认中」（契约 §6.3）；
+// 历史数据缺少这两个时间点时输出空串。
 type RegistrationItem struct {
 	ID              int64  `json:"id"`
 	PatientCardID   int64  `json:"patientCardId"`
@@ -83,6 +103,8 @@ type RegistrationItem struct {
 	OutTradeNo      string `json:"outTradeNo"`
 	PaymentStatus   string `json:"paymentStatus"`
 	CreateDate      string `json:"createDate"`
+	PayableUntil    string `json:"payableUntil"`
+	ValidUntil      string `json:"validUntil"`
 }
 
 // NewRegistrationItems 把挂号实体列表投影为列表项；空输入返回空切片，
@@ -101,6 +123,8 @@ func NewRegistrationItems(items []domainregistration.Registration) []Registratio
 			OutTradeNo:      item.OutTradeNo,
 			PaymentStatus:   item.PaymentStatus,
 			CreateDate:      item.CreateDate,
+			PayableUntil:    formatPaymentTime(item.PayDeadline),
+			ValidUntil:      formatPaymentTime(item.ExpireAt),
 		})
 	}
 	return result

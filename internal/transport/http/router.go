@@ -172,10 +172,22 @@ func NewRouter(
 	//   - RequirePermissionOrPatient 对管理端令牌校验权限编码，对患者令牌放行并由用例按 404 隐藏越权。
 	// 权限编码以数据库 mis_permission 已有记录为准（契约 §1.2）：SELECT 用 REGISTRATION:SELECT，
 	// 建单同时接受规格约定的 REGISTRATION:WRITE 与库中实际存在的 REGISTRATION:INSERT。
+	// 支付用例先于挂号用例构造：建单流程（契约 §6.2）在建单事务提交后调用同一段预下单模块，
+	// 因此挂号用例需要注入由支付用例实现的 port.PaymentPrecreator（禁止各写一套预下单口径）。
+	paymentService := paymentservice.NewService(
+		paymentRepository,
+		alipayGateway,
+		paymentservice.Config{
+			PaymentSubject:   cfg.Alipay.Subject,
+			NotifyURL:        cfg.Alipay.NotifyURL,
+			LogDroppedNotify: cfg.App.Env == "development",
+		},
+	)
 	registrationService := registrationservice.NewService(
 		registrationRepository,
 		patientRepository,
 		patientRepository,
+		paymentService,
 		nil,
 	)
 	registrationHandler := handler.NewRegistrationHandler(registrationService, idempotencyStore)
@@ -200,17 +212,18 @@ func NewRouter(
 	// token，信任来源只有 RSA2 验签，因此单独挂在引擎级路由上（契约 §6.7 部署约束）。
 	// 其余两个接口接受 patient/mis 两种 realm，权限编码用读取类 PAYMENT:SELECT
 	// （契约 §6.5 已把取支付参数降级为幂等读取语义）。
-	paymentService := paymentservice.NewService(
-		paymentRepository,
-		alipayGateway,
-		paymentservice.Config{
-			PaymentSubject:   cfg.Alipay.Subject,
-			NotifyURL:        cfg.Alipay.NotifyURL,
-			LogDroppedNotify: cfg.App.Env == "development",
-		},
-	)
+	// paymentService 已在挂号域之前构造（建单流程需要注入预下单能力）。
 	paymentHandler := handler.NewPaymentHandler(paymentService)
 	router.POST("/api/v1/payments/alipay/notify", paymentHandler.Notify)
+
+	// 创建支付订单接口（POST /api/v1/payments/orders）是支付域的管理端专用例外：
+	// 只有 ROOT 权限码可以直接调用；患者令牌在令牌校验阶段被拒（realm 不匹配返回 401），
+	// 其他管理端用户在权限校验阶段被拒（403）。建单流程（契约 §6.2）在服务内部调用
+	// 同一段用例创建支付订单，不经过本接口（契约 §1.2、§6.9）。
+	paymentAdminRoutes := router.Group("/api/v1/payments")
+	paymentAdminRoutes.Use(requireMisAccess)
+	paymentAdminRoutes.Use(middleware.RequirePermissions(userRepository, []string{"ROOT"}))
+	paymentAdminRoutes.POST("/orders", paymentHandler.Create)
 
 	paymentRoutes := router.Group("/api/v1/payments")
 	paymentRoutes.Use(middleware.RequireSharedAccess(patientService, service))

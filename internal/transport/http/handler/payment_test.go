@@ -1,6 +1,6 @@
-// 支付域 HTTP 契约单测：POST /api/v1/payments、GET /api/v1/payments/{outTradeNo} 与
-// POST /api/v1/payments/alipay/notify 的状态码、错误码与响应形状
-// （spec/04-api-contract.md §6.5-§6.7、§10、§12.4）。
+// 支付域 HTTP 契约单测：POST /api/v1/payments、POST /api/v1/payments/orders、
+// GET /api/v1/payments/{outTradeNo} 与 POST /api/v1/payments/alipay/notify 的
+// 状态码、错误码与响应形状（spec/04-api-contract.md §6.5-§6.9、§10、§12.4）。
 //
 // gin 处于 TestMode，路由按 router.go 的路径挂载；令牌载荷通过
 // c.Set(middleware.ClaimsKey, claims) 模拟「访问令牌已校验通过」；
@@ -10,6 +10,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -51,10 +52,30 @@ type paymentHandlerTestRepo struct {
 	item           *domainpayment.Payment
 	findErr        error
 	markPaidResult bool
+	// saveResult 是 SavePrepayID 的写入结果；false 模拟并发请求已先行写入二维码。
+	saveResult bool
+	// outTradeNoItem 是按交易号读取的专属返回（nil 表示沿用 item），
+	// 用于区分「按挂号编号读取的初始值」与「预下单并发竞争时的回读值」。
+	outTradeNoItem *domainpayment.Payment
+	// outTradeNoErr 只让「按交易号读取」失败（nil 表示不注入故障），
+	// 用于覆盖创建订单在预下单后重读最新状态时的 404/502 分支，
+	// 此时按挂号编号的首次读取仍必须成功。
+	outTradeNoErr error
+	// ensureItem 是 EnsurePaymentWindow 的专属返回（nil 表示沿用 item），
+	// 用于模拟补齐窗口期间订单被异步通知改成终态。
+	ensureItem *domainpayment.Payment
 
-	regQueries []paymentHandlerTestRegQuery
-	outQueries []paymentHandlerTestOutQuery
-	markCalls  []paymentHandlerTestMarkCall
+	regQueries  []paymentHandlerTestRegQuery
+	outQueries  []paymentHandlerTestOutQuery
+	markCalls   []paymentHandlerTestMarkCall
+	ensureCalls []string
+	saveCalls   []paymentHandlerTestSaveCall
+}
+
+// paymentHandlerTestSaveCall 记录二维码回写入参。
+type paymentHandlerTestSaveCall struct {
+	outTradeNo string
+	prepayID   string
 }
 
 // paymentHandlerTestRegQuery 记录按挂号编号读取的入参。
@@ -75,9 +96,9 @@ type paymentHandlerTestMarkCall struct {
 	transactionID string
 }
 
-// newPaymentHandlerTestRepo 构造默认「条件更新成功」的内存桩。
+// newPaymentHandlerTestRepo 构造默认「二维码可写入、条件更新成功」的内存桩。
 func newPaymentHandlerTestRepo() *paymentHandlerTestRepo {
-	return &paymentHandlerTestRepo{markPaidResult: true}
+	return &paymentHandlerTestRepo{markPaidResult: true, saveResult: true}
 }
 
 func (r *paymentHandlerTestRepo) FindPaymentByRegistrationID(
@@ -98,19 +119,34 @@ func (r *paymentHandlerTestRepo) FindPaymentByOutTradeNo(
 	ownerPatientID int64,
 ) (*domainpayment.Payment, error) {
 	r.outQueries = append(r.outQueries, paymentHandlerTestOutQuery{outTradeNo, ownerPatientID})
+	if r.outTradeNoErr != nil {
+		return nil, r.outTradeNoErr
+	}
 	if r.findErr != nil {
 		return nil, r.findErr
+	}
+	// 注入专属回读值时优先返回，供并发重放用例断言「二维码以库中既有值为准」。
+	if r.outTradeNoItem != nil {
+		return r.outTradeNoItem, nil
 	}
 	return r.item, nil
 }
 
-func (r *paymentHandlerTestRepo) EnsurePaymentWindow(_ context.Context, _ string) (*domainpayment.Payment, error) {
+// EnsurePaymentWindow 记录补齐调用；注入 ensureItem 时优先返回，
+// 用于模拟补齐期间订单被异步通知改成终态（CreateOrder 的 TOCTOU 复核）。
+func (r *paymentHandlerTestRepo) EnsurePaymentWindow(_ context.Context, outTradeNo string) (*domainpayment.Payment, error) {
+	r.ensureCalls = append(r.ensureCalls, outTradeNo)
+	if r.ensureItem != nil {
+		return r.ensureItem, nil
+	}
 	return r.item, nil
 }
 
-// SavePrepayID 端口签名要求返回「本次是否真正写入」；handler 用例不覆盖并发分支，固定返回 true。
-func (r *paymentHandlerTestRepo) SavePrepayID(_ context.Context, _ string, _ string) (bool, error) {
-	return true, nil
+// SavePrepayID 记录回写入参并返回注入的写入结果。
+// saveResult=false 模拟并发请求已先行写入二维码，用于覆盖 200 幂等重放分支。
+func (r *paymentHandlerTestRepo) SavePrepayID(_ context.Context, outTradeNo string, prepayID string) (bool, error) {
+	r.saveCalls = append(r.saveCalls, paymentHandlerTestSaveCall{outTradeNo, prepayID})
+	return r.saveResult, nil
 }
 
 func (r *paymentHandlerTestRepo) MarkPaid(_ context.Context, outTradeNo string, transactionID string) (bool, error) {
@@ -118,14 +154,27 @@ func (r *paymentHandlerTestRepo) MarkPaid(_ context.Context, outTradeNo string, 
 	return r.markPaidResult, nil
 }
 
-// paymentHandlerTestGateway 是内存版 port.AlipayGateway 桩；通知入口只用到 VerifyNotify。
+// paymentHandlerTestGateway 是内存版 port.AlipayGateway 桩：通知入口用 VerifyNotify，
+// 创建支付订单入口用 Precreate（记录调用次数与入参）。
 type paymentHandlerTestGateway struct {
 	notifyPayload *domainpayment.NotifyPayload
 	notifyErr     error
 	notifyCalls   []url.Values
+
+	// 预下单桩：precreateResult 为 nil 时回落到默认二维码，precreateErr 用于注入失败。
+	precreateResult *domainpayment.PrecreateResult
+	precreateErr    error
+	precreateCalls  []domainpayment.PrecreateRequest
 }
 
-func (g *paymentHandlerTestGateway) Precreate(_ context.Context, _ domainpayment.PrecreateRequest) (*domainpayment.PrecreateResult, error) {
+func (g *paymentHandlerTestGateway) Precreate(_ context.Context, req domainpayment.PrecreateRequest) (*domainpayment.PrecreateResult, error) {
+	g.precreateCalls = append(g.precreateCalls, req)
+	if g.precreateErr != nil {
+		return nil, g.precreateErr
+	}
+	if g.precreateResult != nil {
+		return g.precreateResult, nil
+	}
 	return &domainpayment.PrecreateResult{QRCode: paymentHandlerTestQRCode}, nil
 }
 
@@ -156,7 +205,7 @@ func newPaymentHandlerTestService(repo port.PaymentRepository, gateway port.Alip
 	})
 }
 
-// newPaymentHandlerTestRouter 按 router.go 的路径挂载三个支付接口。
+// newPaymentHandlerTestRouter 按 router.go 的路径挂载四个支付接口。
 // claims 为 nil 时不注入令牌载荷，用于覆盖未认证分支；
 // 支付宝异步通知入口始终不读用户令牌（契约 §1.2、§6.7）。
 func newPaymentHandlerTestRouter(service *paymentservice.Service, claims *authsession.AccessClaims) *gin.Engine {
@@ -170,6 +219,7 @@ func newPaymentHandlerTestRouter(service *paymentservice.Service, claims *authse
 		c.Next()
 	}
 	engine.POST("/api/v1/payments", injectClaims, paymentHandler.Read)
+	engine.POST("/api/v1/payments/orders", injectClaims, paymentHandler.Create)
 	engine.GET("/api/v1/payments/:outTradeNo", injectClaims, paymentHandler.Detail)
 	engine.POST("/api/v1/payments/alipay/notify", paymentHandler.Notify)
 	return engine
@@ -455,6 +505,52 @@ func TestPaymentReadHidesQRCodeWhenNotPayable(t *testing.T) {
 	}
 }
 
+// TestPaymentReadEmptyQRCodeIsNotPayable 覆盖「窗口仍在（UNPAID 且未过 pay_deadline）但
+// prepay_id 为空」：读路径是纯读取（不补窗口、不预下单），响应必须 payable=false 且不含
+// qrCode，否则会出现 payable=true 却没有任何二维码可渲染的矛盾响应（契约 §6.5）。
+func TestPaymentReadEmptyQRCodeIsNotPayable(t *testing.T) {
+	item := paymentHandlerTestUnpaid()
+	item.PrepayID = ""
+
+	repo := newPaymentHandlerTestRepo()
+	repo.item = item
+	gateway := &paymentHandlerTestGateway{}
+	engine := newPaymentHandlerTestRouter(
+		newPaymentHandlerTestService(repo, gateway),
+		paymentHandlerTestPatientClaims(),
+	)
+
+	recorder := doPaymentRequest(engine, http.MethodPost, "/api/v1/payments", "application/json",
+		`{"registrationId":1001,"method":"ALIPAY"}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("HTTP 状态码 = %d，期望 200（body=%s）", recorder.Code, recorder.Body.String())
+	}
+	object := decodePaymentObject(t, recorder)
+	if got := requirePaymentStringField(t, object, "paymentStatus"); got != domainpayment.PaymentStatusUnpaid {
+		t.Fatalf("paymentStatus = %q，期望 %q", got, domainpayment.PaymentStatusUnpaid)
+	}
+	if requirePaymentBoolField(t, object, "payable") {
+		t.Fatal("prepay_id 为空时 payable 必须为 false（不能声明可支付却没有二维码）")
+	}
+	if raw, exists := object["qrCode"]; exists {
+		t.Fatalf("prepay_id 为空时响应体不得出现 qrCode 键，实际 %s", raw)
+	}
+	// 支付窗口仍按库中原样回传（窗口存在），便于前端展示倒计时。
+	if got := requirePaymentStringField(t, object, "payableUntil"); got != "2026-09-10T01:30:00Z" {
+		t.Fatalf("payableUntil = %q，期望 2026-09-10T01:30:00Z", got)
+	}
+	if got := requirePaymentStringField(t, object, "validUntil"); got != "2026-09-10T01:35:00Z" {
+		t.Fatalf("validUntil = %q，期望 2026-09-10T01:35:00Z", got)
+	}
+	// 读路径不得触达 provider，也不得补写支付窗口（§6.5 纯读取）。
+	if len(gateway.precreateCalls) != 0 {
+		t.Fatalf("读路径不得预下单，实际调用 %d 次", len(gateway.precreateCalls))
+	}
+	if len(repo.ensureCalls) != 0 {
+		t.Fatalf("读路径不得补写支付窗口，实际调用 %d 次", len(repo.ensureCalls))
+	}
+}
+
 // TestPaymentReadMisActorHasNoOwnershipFilter 管理端令牌已由中间件完成权限校验，
 // 用例层不再限定归属（ownerPatientID 传 0，契约 §1.2）。
 func TestPaymentReadMisActorHasNoOwnershipFilter(t *testing.T) {
@@ -669,5 +765,472 @@ func TestPaymentDetailShape(t *testing.T) {
 	}
 	if len(repo.outQueries) != 1 || repo.outQueries[0].ownerPatientID != 0 {
 		t.Fatalf("仓储入参 = %+v，期望 ownerPatientID=0", repo.outQueries)
+	}
+}
+
+// ---- POST /api/v1/payments/orders ----
+
+// TestPaymentCreateRejectsInvalidRequests 覆盖创建支付订单的请求绑定分支（契约 §6.9、§12.4）：
+// 空体、registrationId 缺失/为 0/为负与未知字段 → 422 REQUEST_VALIDATION_FAILED；
+// 类型错误与截断的 JSON → 400 REQUEST_INVALID_JSON；
+// 两种分支都必须返回中文文案，且不得触达仓储与支付宝。
+func TestPaymentCreateRejectsInvalidRequests(t *testing.T) {
+	cases := []struct {
+		name       string
+		body       string
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "空 body", body: ``, wantStatus: http.StatusUnprocessableEntity, wantCode: "REQUEST_VALIDATION_FAILED"},
+		{name: "registrationId 缺失", body: `{}`, wantStatus: http.StatusUnprocessableEntity, wantCode: "REQUEST_VALIDATION_FAILED"},
+		{name: "registrationId 为 0", body: `{"registrationId":0}`, wantStatus: http.StatusUnprocessableEntity, wantCode: "REQUEST_VALIDATION_FAILED"},
+		{name: "registrationId 为负数", body: `{"registrationId":-1}`, wantStatus: http.StatusUnprocessableEntity, wantCode: "REQUEST_VALIDATION_FAILED"},
+		{name: "包含未知字段", body: `{"registrationId":1001,"unknownField":"x"}`, wantStatus: http.StatusUnprocessableEntity, wantCode: "REQUEST_VALIDATION_FAILED"},
+		{name: "registrationId 类型错误", body: `{"registrationId":"1001"}`, wantStatus: http.StatusBadRequest, wantCode: "REQUEST_INVALID_JSON"},
+		{name: "截断的 JSON", body: `{"registrationId":`, wantStatus: http.StatusBadRequest, wantCode: "REQUEST_INVALID_JSON"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newPaymentHandlerTestRepo()
+			repo.item = paymentHandlerTestUnpaid()
+			gateway := &paymentHandlerTestGateway{}
+			engine := newPaymentHandlerTestRouter(
+				newPaymentHandlerTestService(repo, gateway),
+				paymentHandlerTestMisClaims(),
+			)
+
+			recorder := doPaymentRequest(engine, http.MethodPost, "/api/v1/payments/orders", "application/json", tc.body)
+			requirePaymentErrorEnvelope(t, recorder, tc.wantStatus, tc.wantCode)
+
+			var envelope struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil {
+				t.Fatalf("错误响应不是 JSON envelope：%v（body=%s）", err, recorder.Body.String())
+			}
+			requireChineseMessage(t, envelope.Message)
+
+			if len(repo.regQueries) != 0 {
+				t.Fatalf("绑定失败不应触达仓储，实际调用 %d 次", len(repo.regQueries))
+			}
+			if len(gateway.precreateCalls) != 0 {
+				t.Fatalf("绑定失败不应调用支付宝预下单，实际调用 %d 次", len(gateway.precreateCalls))
+			}
+		})
+	}
+}
+
+// TestPaymentCreateRequiresAccessToken 未携带令牌时必须返回 401 AUTH_INVALID_TOKEN，
+// 且不得触达仓储（契约 §1.2、§6.9）。
+func TestPaymentCreateRequiresAccessToken(t *testing.T) {
+	repo := newPaymentHandlerTestRepo()
+	engine := newPaymentHandlerTestRouter(newPaymentHandlerTestService(repo, &paymentHandlerTestGateway{}), nil)
+
+	recorder := doPaymentRequest(engine, http.MethodPost, "/api/v1/payments/orders", "application/json", `{"registrationId":1001}`)
+	requirePaymentErrorEnvelope(t, recorder, http.StatusUnauthorized, "AUTH_INVALID_TOKEN")
+	if len(repo.regQueries) != 0 {
+		t.Fatalf("未认证请求不应触达仓储，实际调用 %d 次", len(repo.regQueries))
+	}
+}
+
+// TestPaymentCreateFirstTimeReturns201 覆盖首次创建（契约 §1.3、§6.9）：
+// prepay_id 为空时调用一次预下单，返回 201 + Location 指向查询地址，
+// 响应含 qrCode 且 payable=true；本接口是管理端专用，必须按不限定归属查询。
+func TestPaymentCreateFirstTimeReturns201(t *testing.T) {
+	item := paymentHandlerTestUnpaid()
+	item.PrepayID = ""
+	repo := newPaymentHandlerTestRepo()
+	repo.item = item
+	gateway := &paymentHandlerTestGateway{
+		precreateResult: &domainpayment.PrecreateResult{QRCode: paymentHandlerTestQRCode},
+	}
+	engine := newPaymentHandlerTestRouter(
+		newPaymentHandlerTestService(repo, gateway),
+		paymentHandlerTestMisClaims(),
+	)
+
+	recorder := doPaymentRequest(engine, http.MethodPost, "/api/v1/payments/orders", "application/json", `{"registrationId":1001}`)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("HTTP 状态码 = %d，期望 201（body=%s）", recorder.Code, recorder.Body.String())
+	}
+	if location := recorder.Header().Get("Location"); location != "/api/v1/payments/"+paymentHandlerTestOutTradeNo {
+		t.Fatalf("Location = %q，期望 %q", location, "/api/v1/payments/"+paymentHandlerTestOutTradeNo)
+	}
+	object := decodePaymentObject(t, recorder)
+	if got := requirePaymentStringField(t, object, "outTradeNo"); got != paymentHandlerTestOutTradeNo {
+		t.Fatalf("outTradeNo = %q，期望 %q", got, paymentHandlerTestOutTradeNo)
+	}
+	if got := requirePaymentStringField(t, object, "qrCode"); got != paymentHandlerTestQRCode {
+		t.Fatalf("qrCode = %q，期望 %q", got, paymentHandlerTestQRCode)
+	}
+	if !requirePaymentBoolField(t, object, "payable") {
+		t.Fatal("窗口内 payable 应为 true")
+	}
+	if len(gateway.precreateCalls) != 1 {
+		t.Fatalf("预下单调用次数 = %d，期望 1", len(gateway.precreateCalls))
+	}
+	if len(repo.regQueries) != 1 || repo.regQueries[0].ownerPatientID != 0 {
+		t.Fatalf("仓储入参 = %+v，期望管理端不限定归属（ownerPatientID=0）", repo.regQueries)
+	}
+}
+
+// TestPaymentCreateIdempotentReturns200 覆盖幂等（契约 §6.9）：
+// 已有 prepay_id 且在支付窗口内时返回 200 与同一个二维码，不重复预下单，也不带 Location。
+func TestPaymentCreateIdempotentReturns200(t *testing.T) {
+	repo := newPaymentHandlerTestRepo()
+	repo.item = paymentHandlerTestUnpaid()
+	gateway := &paymentHandlerTestGateway{
+		precreateResult: &domainpayment.PrecreateResult{QRCode: "https://qr.alipay.com/bax-should-not-happen"},
+	}
+	engine := newPaymentHandlerTestRouter(
+		newPaymentHandlerTestService(repo, gateway),
+		paymentHandlerTestMisClaims(),
+	)
+
+	recorder := doPaymentRequest(engine, http.MethodPost, "/api/v1/payments/orders", "application/json", `{"registrationId":1001}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("HTTP 状态码 = %d，期望 200（body=%s）", recorder.Code, recorder.Body.String())
+	}
+	if location := recorder.Header().Get("Location"); location != "" {
+		t.Fatalf("幂等响应不应带 Location，实际 %q", location)
+	}
+	object := decodePaymentObject(t, recorder)
+	if got := requirePaymentStringField(t, object, "qrCode"); got != paymentHandlerTestQRCode {
+		t.Fatalf("qrCode = %q，期望 %q", got, paymentHandlerTestQRCode)
+	}
+	if !requirePaymentBoolField(t, object, "payable") {
+		t.Fatal("窗口内 payable 应为 true")
+	}
+	if len(gateway.precreateCalls) != 0 {
+		t.Fatalf("已有二维码时不得重复预下单，实际调用 %d 次", len(gateway.precreateCalls))
+	}
+	// isNew=false（本次没有写入二维码）时不得触发「预下单后重读最新状态」。
+	if len(repo.outQueries) != 0 {
+		t.Fatalf("未新建交易时不应按交易号重读，实际调用 %+v", repo.outQueries)
+	}
+}
+
+// TestPaymentCreateTerminalStatesReturn409 覆盖终态冲突（契约 §6.8、§9、§10）：
+// PAID → 409 PAYMENT_ALREADY_PAID，EXPIRED/REFUNDED → 409 PAYMENT_INVALID_TRANSITION，
+// 且都不得调用支付宝。
+func TestPaymentCreateTerminalStatesReturn409(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   string
+		wantCode string
+	}{
+		{name: "已支付", status: domainpayment.PaymentStatusPaid, wantCode: "PAYMENT_ALREADY_PAID"},
+		{name: "已过期", status: domainpayment.PaymentStatusExpired, wantCode: "PAYMENT_INVALID_TRANSITION"},
+		{name: "已退款", status: domainpayment.PaymentStatusRefunded, wantCode: "PAYMENT_INVALID_TRANSITION"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			item := paymentHandlerTestUnpaid()
+			item.PaymentStatus = tc.status
+			item.TransactionID = paymentHandlerTestTradeNo
+			repo := newPaymentHandlerTestRepo()
+			repo.item = item
+			gateway := &paymentHandlerTestGateway{}
+			engine := newPaymentHandlerTestRouter(
+				newPaymentHandlerTestService(repo, gateway),
+				paymentHandlerTestMisClaims(),
+			)
+
+			recorder := doPaymentRequest(engine, http.MethodPost, "/api/v1/payments/orders", "application/json", `{"registrationId":1001}`)
+			requirePaymentErrorEnvelope(t, recorder, http.StatusConflict, tc.wantCode)
+			if len(gateway.precreateCalls) != 0 {
+				t.Fatalf("终态订单不得调用支付宝预下单，实际调用 %d 次", len(gateway.precreateCalls))
+			}
+		})
+	}
+}
+
+// TestPaymentCreatePastPayDeadlineHidesQRCode 覆盖已过 pay_deadline 但未过 expire_at：
+// 200、payable=false、响应不含 qrCode，且不新建支付宝交易（契约 §6.5、§6.8、§6.9）。
+func TestPaymentCreatePastPayDeadlineHidesQRCode(t *testing.T) {
+	item := paymentHandlerTestUnpaid()
+	item.PayDeadline = paymentHandlerTestNow.Add(-time.Minute)
+	item.ExpireAt = paymentHandlerTestNow.Add(4 * time.Minute)
+	repo := newPaymentHandlerTestRepo()
+	repo.item = item
+	gateway := &paymentHandlerTestGateway{}
+	engine := newPaymentHandlerTestRouter(
+		newPaymentHandlerTestService(repo, gateway),
+		paymentHandlerTestMisClaims(),
+	)
+
+	recorder := doPaymentRequest(engine, http.MethodPost, "/api/v1/payments/orders", "application/json", `{"registrationId":1001}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("HTTP 状态码 = %d，期望 200（body=%s）", recorder.Code, recorder.Body.String())
+	}
+	object := decodePaymentObject(t, recorder)
+	if requirePaymentBoolField(t, object, "payable") {
+		t.Fatal("已过 pay_deadline 时 payable 应为 false")
+	}
+	if raw, exists := object["qrCode"]; exists {
+		t.Fatalf("不可支付时响应不得包含 qrCode 字段，实际 %s", raw)
+	}
+	if len(gateway.precreateCalls) != 0 {
+		t.Fatalf("已过支付截止不得新建支付宝交易，实际调用 %d 次", len(gateway.precreateCalls))
+	}
+}
+
+// TestPaymentCreateNotFound 覆盖订单不存在：404 PAYMENT_NOT_FOUND（契约 §10）。
+func TestPaymentCreateNotFound(t *testing.T) {
+	repo := newPaymentHandlerTestRepo()
+	repo.findErr = domainpayment.ErrPaymentNotFound
+	engine := newPaymentHandlerTestRouter(
+		newPaymentHandlerTestService(repo, &paymentHandlerTestGateway{}),
+		paymentHandlerTestMisClaims(),
+	)
+
+	recorder := doPaymentRequest(engine, http.MethodPost, "/api/v1/payments/orders", "application/json", `{"registrationId":1001}`)
+	requirePaymentErrorEnvelope(t, recorder, http.StatusNotFound, "PAYMENT_NOT_FOUND")
+}
+
+// TestPaymentCreateProviderUnavailable 覆盖预下单失败：
+// 502 PAYMENT_PROVIDER_UNAVAILABLE，且响应不得包含二维码（契约 §6.2、§10）。
+func TestPaymentCreateProviderUnavailable(t *testing.T) {
+	item := paymentHandlerTestUnpaid()
+	item.PrepayID = ""
+	repo := newPaymentHandlerTestRepo()
+	repo.item = item
+	gateway := &paymentHandlerTestGateway{precreateErr: port.ErrAlipayUnavailable}
+	engine := newPaymentHandlerTestRouter(
+		newPaymentHandlerTestService(repo, gateway),
+		paymentHandlerTestMisClaims(),
+	)
+
+	recorder := doPaymentRequest(engine, http.MethodPost, "/api/v1/payments/orders", "application/json", `{"registrationId":1001}`)
+	requirePaymentErrorEnvelope(t, recorder, http.StatusBadGateway, "PAYMENT_PROVIDER_UNAVAILABLE")
+	if strings.Contains(recorder.Body.String(), "qrCode") {
+		t.Fatalf("预下单失败不得返回二维码，body=%s", recorder.Body.String())
+	}
+}
+
+// TestPaymentCreateConcurrentReplayReturns200 覆盖并发重放（契约 §6.9）：
+// SavePrepayID 返回 false 表示二维码已被另一请求先行写入，此时接口必须返回 200、
+// 不带 Location，且响应里的 qrCode 为回读到的库中既有值；整个过程只预下单一次、只回写一次。
+func TestPaymentCreateConcurrentReplayReturns200(t *testing.T) {
+	const providerQRCode = "https://qr.alipay.com/bax-loser-provider"
+	const storedQRCode = "https://qr.alipay.com/bax-winner-stored"
+
+	item := paymentHandlerTestUnpaid()
+	item.PrepayID = "" // 无二维码，触发预下单分支
+
+	repo := newPaymentHandlerTestRepo()
+	repo.item = item
+	repo.saveResult = false // 回写被判定为「二维码已存在」
+	stored := paymentHandlerTestUnpaid()
+	stored.PrepayID = storedQRCode
+	repo.outTradeNoItem = stored
+
+	gateway := &paymentHandlerTestGateway{
+		precreateResult: &domainpayment.PrecreateResult{QRCode: providerQRCode},
+	}
+	engine := newPaymentHandlerTestRouter(
+		newPaymentHandlerTestService(repo, gateway),
+		paymentHandlerTestMisClaims(),
+	)
+
+	recorder := doPaymentRequest(engine, http.MethodPost, "/api/v1/payments/orders", "application/json", `{"registrationId":1001}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("HTTP 状态码 = %d，期望 200（并发重放不是首次创建，body=%s）", recorder.Code, recorder.Body.String())
+	}
+	if location := recorder.Header().Get("Location"); location != "" {
+		t.Fatalf("并发重放响应不应带 Location，实际 %q", location)
+	}
+	object := decodePaymentObject(t, recorder)
+	if got := requirePaymentStringField(t, object, "qrCode"); got != storedQRCode {
+		t.Fatalf("qrCode = %q，期望回读到的既有二维码 %q", got, storedQRCode)
+	}
+	if !requirePaymentBoolField(t, object, "payable") {
+		t.Fatal("窗口内 payable 应为 true")
+	}
+	if len(gateway.precreateCalls) != 1 {
+		t.Fatalf("预下单调用次数 = %d，期望 1（不得重复预下单）", len(gateway.precreateCalls))
+	}
+	if len(repo.saveCalls) != 1 || repo.saveCalls[0] != (paymentHandlerTestSaveCall{paymentHandlerTestOutTradeNo, providerQRCode}) {
+		t.Fatalf("二维码回写调用 = %+v，期望仅一次 {%s %s}", repo.saveCalls, paymentHandlerTestOutTradeNo, providerQRCode)
+	}
+	if len(repo.ensureCalls) != 1 || repo.ensureCalls[0] != paymentHandlerTestOutTradeNo {
+		t.Fatalf("补齐支付窗口调用 = %v，期望仅一次 [%s]", repo.ensureCalls, paymentHandlerTestOutTradeNo)
+	}
+	// 这里只应有 precreate 内部的一次回读：isNew=false（SavePrepayID 未写入）时，
+	// CreateOrder 不得再触发一次「重读最新状态」，否则断言到的次数会是 2。
+	if len(repo.outQueries) != 1 || repo.outQueries[0].ownerPatientID != 0 {
+		t.Fatalf("按交易号回读调用 = %+v，期望一次且管理端不限定归属", repo.outQueries)
+	}
+}
+
+// TestPaymentCreateFinalStateRecheckReturns409 覆盖补齐窗口期间的 TOCTOU 复核（契约 §6.9）：
+// 初次读取仍是非终态订单，EnsurePaymentWindow 返回时订单已被异步通知改成终态，
+// 接口必须返回 409（PAID → PAYMENT_ALREADY_PAID，EXPIRED/REFUNDED → PAYMENT_INVALID_TRANSITION），
+// 而不是把已支付、已结束的订单当成 200 或 201 返回。
+func TestPaymentCreateFinalStateRecheckReturns409(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   string
+		wantCode string
+	}{
+		{name: "补齐期间被标记为已支付", status: domainpayment.PaymentStatusPaid, wantCode: "PAYMENT_ALREADY_PAID"},
+		{name: "补齐期间被标记为已过期", status: domainpayment.PaymentStatusExpired, wantCode: "PAYMENT_INVALID_TRANSITION"},
+		{name: "补齐期间被标记为已退款", status: domainpayment.PaymentStatusRefunded, wantCode: "PAYMENT_INVALID_TRANSITION"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// 初始订单非终态且缺少二维码：确保用例真正走到 EnsurePaymentWindow 之后的分支。
+			item := paymentHandlerTestUnpaid()
+			item.PrepayID = ""
+			ensured := paymentHandlerTestUnpaid()
+			ensured.PaymentStatus = tc.status
+			ensured.TransactionID = paymentHandlerTestTradeNo
+
+			repo := newPaymentHandlerTestRepo()
+			repo.item = item
+			repo.ensureItem = ensured
+			gateway := &paymentHandlerTestGateway{}
+			engine := newPaymentHandlerTestRouter(
+				newPaymentHandlerTestService(repo, gateway),
+				paymentHandlerTestMisClaims(),
+			)
+
+			recorder := doPaymentRequest(engine, http.MethodPost, "/api/v1/payments/orders", "application/json", `{"registrationId":1001}`)
+			requirePaymentErrorEnvelope(t, recorder, http.StatusConflict, tc.wantCode)
+			if len(repo.ensureCalls) != 1 {
+				t.Fatalf("补齐支付窗口调用次数 = %d，期望 1（必须走到补齐后的终态复核）", len(repo.ensureCalls))
+			}
+			if len(gateway.precreateCalls) != 0 {
+				t.Fatalf("终态订单不得调用支付宝预下单，实际调用 %d 次", len(gateway.precreateCalls))
+			}
+			if len(repo.saveCalls) != 0 {
+				t.Fatalf("终态订单不得回写二维码，实际回写 %d 次", len(repo.saveCalls))
+			}
+		})
+	}
+}
+
+// TestPaymentCreateTerminalDuringPrecreateReturns409 覆盖「预下单期间订单进入终态」的重读复核
+// （契约 §6.9）：初始订单 UNPAID 且无二维码，本次确实完成了预下单与二维码回写（isNew=true），
+// 但按 out_trade_no 重读发现订单已 PAID / EXPIRED / REFUNDED。接口必须返回 409
+// （PAID → PAYMENT_ALREADY_PAID，EXPIRED/REFUNDED → PAYMENT_INVALID_TRANSITION），
+// 不设置 Location、响应体不含 qrCode 字段与二维码内容，也不得把 HTTP 状态退化成 201/200；
+// 同时确认确实按交易号重读且管理端不限定归属（ownerPatientID=0）。
+func TestPaymentCreateTerminalDuringPrecreateReturns409(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   string
+		wantCode string
+	}{
+		{name: "预下单期间被标记为已支付", status: domainpayment.PaymentStatusPaid, wantCode: "PAYMENT_ALREADY_PAID"},
+		{name: "预下单期间被标记为已过期", status: domainpayment.PaymentStatusExpired, wantCode: "PAYMENT_INVALID_TRANSITION"},
+		{name: "预下单期间被标记为已退款", status: domainpayment.PaymentStatusRefunded, wantCode: "PAYMENT_INVALID_TRANSITION"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			item := paymentHandlerTestUnpaid()
+			item.PrepayID = "" // 无二维码，触发预下单分支
+
+			// 重读返回的最新状态：预下单期间订单已进入终态，且仍带着二维码，
+			// 一旦实现把二维码交付客户端，下面的内容断言会立刻失败。
+			latest := paymentHandlerTestUnpaid()
+			latest.PaymentStatus = tc.status
+			latest.TransactionID = paymentHandlerTestTradeNo
+			latest.PrepayID = paymentHandlerTestQRCode
+
+			repo := newPaymentHandlerTestRepo()
+			repo.item = item
+			repo.outTradeNoItem = latest
+
+			gateway := &paymentHandlerTestGateway{}
+			engine := newPaymentHandlerTestRouter(
+				newPaymentHandlerTestService(repo, gateway),
+				paymentHandlerTestMisClaims(),
+			)
+
+			recorder := doPaymentRequest(engine, http.MethodPost, "/api/v1/payments/orders", "application/json", `{"registrationId":1001}`)
+			requirePaymentErrorEnvelope(t, recorder, http.StatusConflict, tc.wantCode)
+			if location := recorder.Header().Get("Location"); location != "" {
+				t.Fatalf("终态冲突响应不应带 Location，实际 %q", location)
+			}
+			object := decodePaymentObject(t, recorder)
+			if _, exists := object["qrCode"]; exists {
+				t.Fatalf("终态冲突响应不得包含 qrCode 字段，实际 body=%s", recorder.Body.String())
+			}
+			if body := recorder.Body.String(); strings.Contains(body, paymentHandlerTestQRCode) {
+				t.Fatalf("终态冲突响应不得出现二维码内容，实际 body=%s", body)
+			}
+
+			// 本次确实完成了预下单与回写（isNew=true），才会走到「重读最新状态」这一步。
+			if len(gateway.precreateCalls) != 1 {
+				t.Fatalf("预下单调用次数 = %d，期望 1", len(gateway.precreateCalls))
+			}
+			if len(repo.saveCalls) != 1 || repo.saveCalls[0] != (paymentHandlerTestSaveCall{paymentHandlerTestOutTradeNo, paymentHandlerTestQRCode}) {
+				t.Fatalf("二维码回写调用 = %+v，期望仅一次 {%s %s}",
+					repo.saveCalls, paymentHandlerTestOutTradeNo, paymentHandlerTestQRCode)
+			}
+			// 必须按 out_trade_no 重读，且管理端不限定归属（ownerPatientID=0）。
+			if len(repo.outQueries) != 1 || repo.outQueries[0] != (paymentHandlerTestOutQuery{paymentHandlerTestOutTradeNo, 0}) {
+				t.Fatalf("按交易号重读入参 = %+v，期望一次 {%s 0}", repo.outQueries, paymentHandlerTestOutTradeNo)
+			}
+		})
+	}
+}
+
+// TestPaymentCreateRecheckErrors 覆盖预下单后重读最新状态的失败分支（契约 §6.9、§10）：
+// 重读时订单已不存在 → 404 PAYMENT_NOT_FOUND；重读报错 → 502 DEPENDENCY_UNAVAILABLE。
+// 两种失败都不得把二维码交给客户端，也不得设置 Location。
+func TestPaymentCreateRecheckErrors(t *testing.T) {
+	cases := []struct {
+		name          string
+		outTradeNoErr error
+		wantStatus    int
+		wantCode      string
+	}{
+		{
+			name:          "重读时订单已不存在",
+			outTradeNoErr: domainpayment.ErrPaymentNotFound,
+			wantStatus:    http.StatusNotFound,
+			wantCode:      "PAYMENT_NOT_FOUND",
+		},
+		{
+			name:          "重读依赖故障",
+			outTradeNoErr: errors.New("postgres 连接失败"),
+			wantStatus:    http.StatusBadGateway,
+			wantCode:      "DEPENDENCY_UNAVAILABLE",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			item := paymentHandlerTestUnpaid()
+			item.PrepayID = ""
+
+			repo := newPaymentHandlerTestRepo()
+			repo.item = item
+			repo.outTradeNoErr = tc.outTradeNoErr
+
+			gateway := &paymentHandlerTestGateway{}
+			engine := newPaymentHandlerTestRouter(
+				newPaymentHandlerTestService(repo, gateway),
+				paymentHandlerTestMisClaims(),
+			)
+
+			recorder := doPaymentRequest(engine, http.MethodPost, "/api/v1/payments/orders", "application/json", `{"registrationId":1001}`)
+			requirePaymentErrorEnvelope(t, recorder, tc.wantStatus, tc.wantCode)
+			if location := recorder.Header().Get("Location"); location != "" {
+				t.Fatalf("重读失败响应不应带 Location，实际 %q", location)
+			}
+			if body := recorder.Body.String(); strings.Contains(body, paymentHandlerTestQRCode) {
+				t.Fatalf("重读失败响应不得出现二维码内容，实际 body=%s", body)
+			}
+			if len(gateway.precreateCalls) != 1 || len(repo.saveCalls) != 1 {
+				t.Fatalf("预下单/回写次数 = %d/%d，期望各 1（必须先完成预下单再重读）",
+					len(gateway.precreateCalls), len(repo.saveCalls))
+			}
+			if len(repo.outQueries) != 1 || repo.outQueries[0] != (paymentHandlerTestOutQuery{paymentHandlerTestOutTradeNo, 0}) {
+				t.Fatalf("按交易号重读入参 = %+v，期望一次 {%s 0}", repo.outQueries, paymentHandlerTestOutTradeNo)
+			}
+		})
 	}
 }

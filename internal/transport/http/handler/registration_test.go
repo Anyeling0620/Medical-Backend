@@ -22,6 +22,7 @@ import (
 
 	domainauth "Medical-Web-Backend/internal/domain/auth"
 	"Medical-Web-Backend/internal/domain/patient"
+	domainpayment "Medical-Web-Backend/internal/domain/payment"
 	domainregistration "Medical-Web-Backend/internal/domain/registration"
 	"Medical-Web-Backend/internal/port"
 	"Medical-Web-Backend/internal/transport/http/middleware"
@@ -45,6 +46,11 @@ const (
 	registrationHandlerTestScheduleID int64 = 12
 	// registrationHandlerTestTradeNo 是核对格式用的交易号样例（14 位时间戳 + 12 位十六进制）。
 	registrationHandlerTestTradeNoPattern = `^[0-9]{14}[0-9a-f]{12}$`
+	// registrationHandlerTestQRCode 是假预下单桩返回并"已落库"的二维码。
+	registrationHandlerTestQRCode = "https://qr.alipay.com/bax-registration-handler"
+	// registrationHandlerTestPayOffset / ValidOffset 是预下单结果相对固定时钟的支付窗口。
+	registrationHandlerTestPayOffset   = 30 * time.Minute
+	registrationHandlerTestValidOffset = 35 * time.Minute
 )
 
 // registrationHandlerNow 是固定业务时刻（业务时区 2026-09-10 09:00）。
@@ -65,6 +71,9 @@ type registrationHandlerRepo struct {
 	detail      *domainregistration.Detail
 	detailErr   error
 
+	// compensateErr 注入整单补偿失败，用于断言补偿失败仍返回 502。
+	compensateErr error
+
 	createCalls        int
 	lastCreateInput    domainregistration.CreateInput
 	listCalls          int
@@ -73,6 +82,9 @@ type registrationHandlerRepo struct {
 	lastLimit          int
 	detailCalls        int
 	lastOwnerPatientID int64
+
+	compensateCalls  int
+	lastCompensateID int64
 }
 
 func (r *registrationHandlerRepo) FindScheduleSnapshot(
@@ -158,6 +170,16 @@ func (r *registrationHandlerRepo) FindRegistrationDetail(
 	return &copied, nil
 }
 
+// CompensateRegistration 记录补偿入参并返回注入的故障，供建单预下单失败用例断言。
+func (r *registrationHandlerRepo) CompensateRegistration(
+	_ context.Context,
+	registrationID int64,
+) error {
+	r.compensateCalls++
+	r.lastCompensateID = registrationID
+	return r.compensateErr
+}
+
 // registrationHandlerCards 是内存版 port.PatientCardRepository 桩（只实现两个读取方法）。
 type registrationHandlerCards struct {
 	port.PatientCardRepository
@@ -210,13 +232,48 @@ func (r *registrationHandlerPatients) FindPatientByID(
 	return &copied, nil
 }
 
+// registrationHandlerPrecreator 是内存版 port.PaymentPrecreator 桩：
+// 记录调用次数与挂号编号，并可按需注入返回值或故障。
+type registrationHandlerPrecreator struct {
+	payment *domainpayment.Payment
+	err     error
+
+	calls            int
+	lastRegistration int64
+}
+
+func (p *registrationHandlerPrecreator) PrecreateForOrder(
+	_ context.Context,
+	registrationID int64,
+) (*domainpayment.Payment, error) {
+	p.calls++
+	p.lastRegistration = registrationID
+	if p.err != nil {
+		return nil, p.err
+	}
+	if p.payment != nil {
+		copied := *p.payment
+		return &copied, nil
+	}
+	return &domainpayment.Payment{
+		RegistrationID: registrationID,
+		OutTradeNo:     "20260910090000abcdef123456",
+		PaymentStatus:  domainpayment.PaymentStatusUnpaid,
+		PrepayID:       registrationHandlerTestQRCode,
+		PrecreateAt:    registrationHandlerNow,
+		PayDeadline:    registrationHandlerNow.Add(registrationHandlerTestPayOffset),
+		ExpireAt:       registrationHandlerNow.Add(registrationHandlerTestValidOffset),
+	}, nil
+}
+
 // registrationHandlerEnv 汇总四个路由、两个 realm 的引擎与依赖桩。
 type registrationHandlerEnv struct {
-	repo     *registrationHandlerRepo
-	store    *fakeIdemStore
-	patient  *gin.Engine
-	mis      *gin.Engine
-	noClaims *gin.Engine
+	repo       *registrationHandlerRepo
+	store      *fakeIdemStore
+	precreator *registrationHandlerPrecreator
+	patient    *gin.Engine
+	mis        *gin.Engine
+	noClaims   *gin.Engine
 }
 
 // registrationHandlerCompleteCard 返回资料完整、属于测试患者的就诊卡。
@@ -278,17 +335,19 @@ func newRegistrationHandlerEnv(t *testing.T) *registrationHandlerEnv {
 		},
 	}
 
+	precreator := &registrationHandlerPrecreator{}
 	service := registrationservice.NewService(
-		repo, cards, patients, func() time.Time { return registrationHandlerNow })
+		repo, cards, patients, precreator, func() time.Time { return registrationHandlerNow })
 	store := newFakeIdemStore()
 	h := NewRegistrationHandler(service, store)
 
 	return &registrationHandlerEnv{
-		repo:     repo,
-		store:    store,
-		patient:  registrationHandlerEngine(t, h, domainauth.RealmPatient, registrationHandlerTestPatientID),
-		mis:      registrationHandlerEngine(t, h, domainauth.RealmMis, registrationHandlerTestMisUserID),
-		noClaims: registrationHandlerEngine(t, h, "", 0),
+		repo:       repo,
+		store:      store,
+		precreator: precreator,
+		patient:    registrationHandlerEngine(t, h, domainauth.RealmPatient, registrationHandlerTestPatientID),
+		mis:        registrationHandlerEngine(t, h, domainauth.RealmMis, registrationHandlerTestMisUserID),
+		noClaims:   registrationHandlerEngine(t, h, "", 0),
 	}
 }
 
@@ -477,6 +536,9 @@ func TestRegistrationListEndpoint(t *testing.T) {
 			OutTradeNo:      "202609080001",
 			PaymentStatus:   domainregistration.PaymentStatusUnpaid,
 			CreateDate:      "2026-09-08",
+			// 列表项必须回传支付窗口：payableUntil = pay_deadline、validUntil = expire_at（§6.3）。
+			PayDeadline: registrationHandlerNow.Add(registrationHandlerTestPayOffset),
+			ExpireAt:    registrationHandlerNow.Add(registrationHandlerTestValidOffset),
 		}}
 		env.repo.total = 1
 
@@ -501,11 +563,23 @@ func TestRegistrationListEndpoint(t *testing.T) {
 		assertRegistrationKeys(t, "列表项", item, []string{
 			"id", "patientCardId", "doctorId", "subdepartmentId", "date", "slot",
 			"amount", "outTradeNo", "paymentStatus", "createDate",
+			"payableUntil", "validUntil",
 		})
-		for _, forbidden := range []string{"workPlanId", "scheduleId", "prepayId", "transactionId"} {
+		// 二维码/交易号只允许出现在建单（§6.2）与取支付参数（§6.5）两个受保护响应中，
+		// 列表项（§6.3）不得出现 qrCode/prepayId/transactionId。
+		for _, forbidden := range []string{"workPlanId", "scheduleId", "qrCode", "prepayId", "transactionId"} {
 			if _, exists := item[forbidden]; exists {
 				t.Errorf("列表项不得包含 %s（契约 §6.3）", forbidden)
 			}
+		}
+		// 与建单 201 同一口径：RFC3339、UTC，取值来自 pay_deadline / expire_at。
+		wantPayableUntil := registrationHandlerNow.Add(registrationHandlerTestPayOffset).UTC().Format(time.RFC3339)
+		if item["payableUntil"] != wantPayableUntil {
+			t.Errorf("payableUntil = %v, want %q（等于 pay_deadline）", item["payableUntil"], wantPayableUntil)
+		}
+		wantValidUntil := registrationHandlerNow.Add(registrationHandlerTestValidOffset).UTC().Format(time.RFC3339)
+		if item["validUntil"] != wantValidUntil {
+			t.Errorf("validUntil = %v, want %q（等于 expire_at）", item["validUntil"], wantValidUntil)
 		}
 		if env.repo.lastFilter.OwnerPatientID == nil ||
 			*env.repo.lastFilter.OwnerPatientID != registrationHandlerTestPatientID {
@@ -528,6 +602,41 @@ func TestRegistrationListEndpoint(t *testing.T) {
 		}
 		if !strings.Contains(w.Body.String(), `"items":[]`) {
 			t.Errorf("空列表必须输出 items:[] 而不是 null：%s", w.Body.String())
+		}
+	})
+
+	t.Run("历史数据缺少支付窗口时输出空串", func(t *testing.T) {
+		env := newRegistrationHandlerEnv(t)
+		// pay_deadline/expire_at 为空（NULL）：列表项仍须返回两个键，但值为空串。
+		env.repo.items = []domainregistration.Registration{{
+			ID:            1001,
+			PatientCardID: registrationHandlerTestCardID,
+			DoctorID:      16,
+			Date:          "2026-09-20",
+			Slot:          1,
+			Amount:        "80.00",
+			OutTradeNo:    "202609080001",
+			PaymentStatus: domainregistration.PaymentStatusUnpaid,
+			CreateDate:    "2026-09-08",
+		}}
+		env.repo.total = 1
+
+		w := performRegistration(env.patient, http.MethodGet, "/api/v1/registrations?page=1&pageSize=20", "", nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+		}
+		body := decodeRegistrationBody(t, w)
+		items, ok := body["items"].([]any)
+		if !ok || len(items) != 1 {
+			t.Fatalf("items = %#v, want 单元素数组", body["items"])
+		}
+		item, ok := items[0].(map[string]any)
+		if !ok {
+			t.Fatalf("items[0] = %#v, want 对象", items[0])
+		}
+		if item["payableUntil"] != "" || item["validUntil"] != "" {
+			t.Errorf("零值支付窗口应序列化为空串：payableUntil=%v validUntil=%v",
+				item["payableUntil"], item["validUntil"])
 		}
 	})
 
@@ -832,6 +941,7 @@ func TestRegistrationCreateEndpoint(t *testing.T) {
 		assertRegistrationKeys(t, "建单响应", body, []string{
 			"id", "patientCardId", "workPlanId", "scheduleId", "doctorId", "subdepartmentId",
 			"date", "slot", "amount", "outTradeNo", "paymentStatus", "createDate",
+			"qrCode", "payableUntil", "validUntil",
 		})
 		if body["id"] != float64(1001) {
 			t.Errorf("id = %v, want 1001", body["id"])
@@ -855,8 +965,24 @@ func TestRegistrationCreateEndpoint(t *testing.T) {
 		if _, exists := body["prepayId"]; exists {
 			t.Error("prepayId 不得出现在建单响应中（契约 §6.2、§6.3）")
 		}
+		// 201 必须回传同一次请求内完成的预下单结果：二维码与两个时间点（RFC3339、UTC）。
+		if body["qrCode"] != registrationHandlerTestQRCode {
+			t.Errorf("qrCode = %v, want %q", body["qrCode"], registrationHandlerTestQRCode)
+		}
+		wantPayableUntil := registrationHandlerNow.Add(registrationHandlerTestPayOffset).UTC().Format(time.RFC3339)
+		if body["payableUntil"] != wantPayableUntil {
+			t.Errorf("payableUntil = %v, want %q", body["payableUntil"], wantPayableUntil)
+		}
+		wantValidUntil := registrationHandlerNow.Add(registrationHandlerTestValidOffset).UTC().Format(time.RFC3339)
+		if body["validUntil"] != wantValidUntil {
+			t.Errorf("validUntil = %v, want %q", body["validUntil"], wantValidUntil)
+		}
 		if env.repo.createCalls != 1 {
 			t.Errorf("CreateRegistration 调用次数 = %d, want 1", env.repo.createCalls)
+		}
+		if env.precreator.calls != 1 || env.precreator.lastRegistration != 1001 {
+			t.Errorf("预下单调用 %d 次（registrationId=%d），want 1 次（registrationId=1001）",
+				env.precreator.calls, env.precreator.lastRegistration)
 		}
 		if env.repo.lastCreateInput.PatientCardID != registrationHandlerTestCardID {
 			t.Errorf("落库 patientCardId = %d, want %d",
@@ -994,6 +1120,41 @@ func TestRegistrationCreateEndpoint(t *testing.T) {
 		}
 		if code := registrationErrorCode(t, w); code != "DEPENDENCY_UNAVAILABLE" {
 			t.Errorf("code = %q, want DEPENDENCY_UNAVAILABLE", code)
+		}
+	})
+
+	t.Run("预下单失败返回 502 且不写入幂等存储", func(t *testing.T) {
+		env := newRegistrationHandlerEnv(t)
+		env.precreator.err = errors.New("alipay precreate down")
+		headers := map[string]string{"Idempotency-Key": "registration-create-precreate-fail"}
+
+		first := performRegistration(env.patient, http.MethodPost, "/api/v1/registrations", requestBody, headers)
+		if first.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502; body=%s", first.Code, first.Body.String())
+		}
+		body := decodeRegistrationBody(t, first)
+		if body["code"] != "PAYMENT_PROVIDER_UNAVAILABLE" {
+			t.Errorf("code = %v, want PAYMENT_PROVIDER_UNAVAILABLE", body["code"])
+		}
+		if _, exists := body["qrCode"]; exists {
+			t.Error("预下单失败响应不得包含 qrCode")
+		}
+		if env.repo.compensateCalls != 1 || env.repo.lastCompensateID != 1001 {
+			t.Errorf("预下单失败应补偿一次（registrationId=1001），实际 %d 次（id=%d）",
+				env.repo.compensateCalls, env.repo.lastCompensateID)
+		}
+		if env.store.saves != 0 || len(env.store.results) != 0 {
+			t.Errorf("5xx 不得写入幂等存储：saves=%d results=%d", env.store.saves, len(env.store.results))
+		}
+
+		// 同一幂等键再次请求：5xx 不入库，应重新执行业务而不是重放第一次响应。
+		second := performRegistration(env.patient, http.MethodPost, "/api/v1/registrations", requestBody, headers)
+		if second.Code != http.StatusBadGateway {
+			t.Fatalf("重试 status = %d, want 502; body=%s", second.Code, second.Body.String())
+		}
+		if env.repo.createCalls != 2 {
+			t.Errorf("5xx 未入幂等存储，重试应重新建单，CreateRegistration 调用 %d 次，want 2",
+				env.repo.createCalls)
 		}
 	})
 }

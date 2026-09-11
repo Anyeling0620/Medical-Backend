@@ -81,10 +81,11 @@ WHERE btrim(r.out_trade_no) = btrim($1)`
 
 // ensurePaymentWindowQuery 幂等补齐三个支付时间点。
 //
-// 最小闭环阶段建单流程尚未写入 precreate_at/pay_deadline/expire_at，这里在首次取支付参数时
-// 用数据库 now() 一次补齐：COALESCE 保证已有值不被覆盖，且三个表达式引用的是同一行旧值，
-// 因此 pay_deadline、expire_at 与 precreate_at 仍保持 +30、+35 分钟的固定关系（契约 §6.8）。
-// 只更新存在缺失的行，已写定窗口的订单不会被反复写。
+// 建单流程（契约 §6.2）已在建单 INSERT 内用数据库 now() 写定这三个字段，因此对新建订单本
+// 语句不产生写入；它只用于创建支付订单接口（契约 §6.9）补齐历史订单的支付窗口：COALESCE
+// 保证已有值不被覆盖，且三个表达式引用的是同一行旧值，因此 pay_deadline、expire_at 与
+// precreate_at 仍保持 +30、+35 分钟的固定关系（契约 §6.8）。只更新存在缺失的行，
+// 已写定窗口的订单不会被反复写。
 //
 // 条件里的 payment_status = 未付款 用于把写入收敛在「仍可支付」的订单上：
 // 已 PAID/EXPIRED/REFUNDED 的历史脏数据行即使三个时间点为空也不得补窗口，

@@ -2,7 +2,10 @@ package repo
 
 import (
 	"database/sql"
+	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -168,15 +171,19 @@ func TestRegistrationOrderBy(t *testing.T) {
 	}
 }
 
-// TestRegistrationColumnsExcludeSensitivePaymentFields 列表/详情投影不得包含
-// prepay_id 与 transaction_id：契约 §6.3 明确支付二维码内容只在受保护的支付响应中返回。
+// TestRegistrationColumnsExcludeSensitivePaymentFields 列表/详情投影必须包含支付窗口两列
+// （pay_deadline/expire_at，契约 §6.3 列表项 payableUntil/validUntil 的数据来源），
+// 且不得包含 prepay_id 与 transaction_id：契约 §6.3 明确支付二维码内容只在受保护的支付响应中返回。
 func TestRegistrationColumnsExcludeSensitivePaymentFields(t *testing.T) {
 	for _, forbidden := range []string{"prepay_id", "transaction_id"} {
 		if strings.Contains(registrationColumns, forbidden) {
 			t.Errorf("registrationColumns 不应包含 %q：\n%s", forbidden, registrationColumns)
 		}
 	}
-	for _, required := range []string{"r.id", "btrim(r.out_trade_no)", "r.payment_status", "r.create_time"} {
+	for _, required := range []string{
+		"r.id", "btrim(r.out_trade_no)", "r.payment_status", "r.create_time",
+		"r.pay_deadline", "r.expire_at",
+	} {
 		if !strings.Contains(registrationColumns, required) {
 			t.Errorf("registrationColumns 缺少 %q：\n%s", required, registrationColumns)
 		}
@@ -291,5 +298,80 @@ func TestRegistrationAmount(t *testing.T) {
 				t.Errorf("registrationAmount(%+v) = %q, want %q", tc.raw, got, tc.want)
 			}
 		})
+	}
+}
+
+// readPostgresRegistrationSource 读取本包生产文件 postgres_registration.go 的源码文本。
+//
+// 建单 INSERT 是内联在 createRegistrationTx 里的字符串（未提为包级常量），因此这里沿用
+// alipay_gateway_e2e_test.go 的做法，用测试文件路径反推源码路径，对 SQL 文本做断言；
+// 不连接数据库，也不引入 sqlmock。
+func readPostgresRegistrationSource(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("无法定位测试文件路径")
+	}
+	path := filepath.Join(filepath.Dir(thisFile), "postgres_registration.go")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取 %s 失败：%v", path, err)
+	}
+	return string(raw)
+}
+
+// TestCreateRegistrationInsertWritesPaymentWindow 建单 INSERT 必须在同一条语句内用数据库
+// now() 写定三个支付时间点（契约 §6.2、业务说明第 2 节）：precreate_at = now()、
+// pay_deadline = now() + 30 分钟、expire_at = now() + 35 分钟；now() 是事务时间戳，
+// 同一条 INSERT 内取值一致，保证订单有效期与二维码有效期同起点。
+func TestCreateRegistrationInsertWritesPaymentWindow(t *testing.T) {
+	source := readPostgresRegistrationSource(t)
+
+	for _, fragment := range []string{
+		"INSERT INTO hospital.medical_registration",
+		"precreate_at, pay_deadline, expire_at",
+		"now(), now() + interval '30 minutes', now() + interval '35 minutes'",
+	} {
+		if !strings.Contains(source, fragment) {
+			t.Errorf("建单 INSERT 缺少片段 %q", fragment)
+		}
+	}
+}
+
+// TestCompensateRegistrationSQLSemantics 补偿路径必须「先锁行确认未付款，再删除，
+// 最后按计划级 -> 时段级各减 1」，且两级 num 都有 num > 0 保护
+// （契约 §6.2、业务说明第 3.3、4 节）。
+func TestCompensateRegistrationSQLSemantics(t *testing.T) {
+	if !strings.Contains(compensateRegistrationQuery, "FOR UPDATE") {
+		t.Errorf("补偿前必须锁行：%s", compensateRegistrationQuery)
+	}
+	if !strings.Contains(compensateRegistrationQuery, "payment_status") {
+		t.Errorf("补偿前必须读取 payment_status：%s", compensateRegistrationQuery)
+	}
+	if !strings.Contains(compensateRegistrationQuery, "WHERE id = $1") {
+		t.Errorf("补偿查询应按主键定位：%s", compensateRegistrationQuery)
+	}
+	if !strings.Contains(deleteRegistrationQuery, "DELETE FROM hospital.medical_registration") {
+		t.Errorf("补偿必须删除挂号记录：%s", deleteRegistrationQuery)
+	}
+	if !strings.Contains(deleteRegistrationQuery, "payment_status = $2") {
+		t.Errorf("删除必须带未付款条件，避免删掉已收款订单：%s", deleteRegistrationQuery)
+	}
+	for name, query := range map[string]string{
+		"计划级": releasePlanQuotaQuery,
+		"时段级": releaseSlotQuotaQuery,
+	} {
+		if !strings.Contains(query, "num = num - 1") {
+			t.Errorf("%s号源回退必须自减 1：%s", name, query)
+		}
+		if !strings.Contains(query, "num > 0") {
+			t.Errorf("%s号源回退必须带 num > 0 保护：%s", name, query)
+		}
+	}
+	if !strings.Contains(releasePlanQuotaQuery, "hospital.doctor_work_plan SET") {
+		t.Errorf("计划级回退应更新 doctor_work_plan：%s", releasePlanQuotaQuery)
+	}
+	if !strings.Contains(releaseSlotQuotaQuery, "hospital.doctor_work_plan_schedule SET") {
+		t.Errorf("时段级回退应更新 doctor_work_plan_schedule：%s", releaseSlotQuotaQuery)
 	}
 }

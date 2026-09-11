@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 
 	"Medical-Web-Backend/internal/config"
 	domainauth "Medical-Web-Backend/internal/domain/auth"
+	domainpayment "Medical-Web-Backend/internal/domain/payment"
 	"Medical-Web-Backend/internal/port"
 	userservice "Medical-Web-Backend/internal/usecase/misuser"
 )
@@ -143,6 +146,7 @@ func TestRouterExposesContractRoutes(t *testing.T) {
 		"DELETE /api/v1/schedule/slots/:slotId",
 		// 支付域接口（规范第 6 章）
 		"POST /api/v1/payments",
+		"POST /api/v1/payments/orders",
 		"GET /api/v1/payments/:outTradeNo",
 		"POST /api/v1/payments/alipay/notify",
 		// 患者端认证与当前患者（规范第 7 章）
@@ -320,4 +324,217 @@ func TestRouterAuthLogoutReachableWithoutRepository(t *testing.T) {
 	if body["message"] != "访问令牌无效" {
 		t.Errorf("message = %v, want 访问令牌无效（证明已到达 handler，未被中间件拦截）", body["message"])
 	}
+}
+
+// ---- POST /api/v1/payments/orders 权限矩阵 ----
+
+// paymentOrdersTestUserRepo 让管理端主体拥有 ROOT 权限码，用于验证 ROOT 可直接创建支付订单；
+// 其余查询沿用空实现的 realmRouterUserRepo。
+type paymentOrdersTestUserRepo struct{ realmRouterUserRepo }
+
+func (paymentOrdersTestUserRepo) Permissions(_ context.Context, _ int64) ([]string, error) {
+	return []string{"ROOT"}, nil
+}
+
+// paymentOrdersTestRepo 是 port.PaymentRepository 的最小桩：返回一条支付窗口完整、
+// 但尚未预下单的 UNPAID 订单，并记录归属开关，供权限矩阵用例断言管理端不限定归属。
+type paymentOrdersTestRepo struct {
+	item       *domainpayment.Payment
+	regQueries []int64
+}
+
+func (r *paymentOrdersTestRepo) FindPaymentByRegistrationID(
+	_ context.Context,
+	_ int64,
+	ownerPatientID int64,
+) (*domainpayment.Payment, error) {
+	r.regQueries = append(r.regQueries, ownerPatientID)
+	return r.itemOrNotFound()
+}
+
+func (r *paymentOrdersTestRepo) FindPaymentByOutTradeNo(
+	_ context.Context,
+	_ string,
+	_ int64,
+) (*domainpayment.Payment, error) {
+	return r.itemOrNotFound()
+}
+
+func (r *paymentOrdersTestRepo) EnsurePaymentWindow(_ context.Context, _ string) (*domainpayment.Payment, error) {
+	return r.itemOrNotFound()
+}
+
+func (r *paymentOrdersTestRepo) SavePrepayID(_ context.Context, _ string, prepayID string) (bool, error) {
+	if r.item != nil {
+		r.item.PrepayID = prepayID
+	}
+	return true, nil
+}
+
+func (r *paymentOrdersTestRepo) MarkPaid(_ context.Context, _ string, _ string) (bool, error) {
+	return true, nil
+}
+
+// itemOrNotFound 返回订单副本；未注入订单时按不存在处理，避免用例误判。
+func (r *paymentOrdersTestRepo) itemOrNotFound() (*domainpayment.Payment, error) {
+	if r.item == nil {
+		return nil, domainpayment.ErrPaymentNotFound
+	}
+	copied := *r.item
+	return &copied, nil
+}
+
+// paymentOrdersTestGateway 是 port.AlipayGateway 的最小桩：预下单固定返回一个二维码。
+type paymentOrdersTestGateway struct {
+	precreateCalls []domainpayment.PrecreateRequest
+}
+
+func (g *paymentOrdersTestGateway) Precreate(
+	_ context.Context,
+	req domainpayment.PrecreateRequest,
+) (*domainpayment.PrecreateResult, error) {
+	g.precreateCalls = append(g.precreateCalls, req)
+	return &domainpayment.PrecreateResult{QRCode: "https://qr.alipay.com/bax-router-test"}, nil
+}
+
+func (g *paymentOrdersTestGateway) QueryTrade(_ context.Context, _ string) (*domainpayment.TradeQueryResult, error) {
+	return &domainpayment.TradeQueryResult{}, nil
+}
+
+func (g *paymentOrdersTestGateway) VerifyNotify(_ context.Context, _ url.Values) (*domainpayment.NotifyPayload, error) {
+	return nil, port.ErrNotifySignatureInvalid
+}
+
+// 编译期确认两个桩完整实现端口契约。
+var (
+	_ port.PaymentRepository = (*paymentOrdersTestRepo)(nil)
+	_ port.AlipayGateway     = (*paymentOrdersTestGateway)(nil)
+)
+
+// signPaymentOrdersAccessToken 用契约测试密钥签发指定 realm 的合法 access token。
+func signPaymentOrdersAccessToken(t *testing.T, realm domainauth.Realm) string {
+	t.Helper()
+	claims := &userservice.AccessClaims{
+		UserID:    7,
+		Username:  "mis-admin",
+		TokenType: userservice.TokenTypeAccess,
+		Realm:     realm,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        "payment-orders-jti-" + string(realm),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(15 * time.Minute)),
+		},
+	}
+	signed, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).
+		SignedString([]byte(contractTestJWTSecret))
+	if err != nil {
+		t.Fatalf("签发支付订单接口测试 access token 失败：%v", err)
+	}
+	return signed
+}
+
+// newPaymentOrdersTestRouter 构造带 ROOT 权限用户仓库与支付桩的真实路由树，
+// 用于验证 paymentAdminRoutes 的 realm 与权限期望。
+func newPaymentOrdersTestRouter(
+	t *testing.T,
+	repo port.PaymentRepository,
+	gateway port.AlipayGateway,
+) *gin.Engine {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	return NewRouter(
+		func() map[string]any { return map[string]any{"status": "ok"} },
+		config.Config{Auth: config.AuthConfig{JWTSecret: contractTestJWTSecret}},
+		paymentOrdersTestUserRepo{},
+		contractTokenRepo{},
+		nil, // doctorRepository
+		nil, // scheduleRepository
+		nil, // idempotencyStore
+		nil, // patientRepository
+		nil, // wechatAuthenticator
+		nil, // registrationRepository
+		repo,
+		gateway,
+	)
+}
+
+// performPaymentOrdersCreate 以指定令牌 POST /api/v1/payments/orders。
+func performPaymentOrdersCreate(router *gin.Engine, token, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/payments/orders", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w
+}
+
+// TestRouterPaymentOrdersPermissionMatrix 覆盖创建支付订单接口的权限矩阵（契约 §1.2、§6.9）：
+// ROOT 管理端令牌成功创建（201 + Location）；非 ROOT 管理端令牌 403 AUTH_FORBIDDEN；
+// 患者令牌因 realm 不匹配 401 AUTH_INVALID_TOKEN；无令牌 401。
+func TestRouterPaymentOrdersPermissionMatrix(t *testing.T) {
+	const body = `{"registrationId":1001}`
+
+	// 支付窗口完整但 prepay_id 为空：命中首次预下单分支，成功时返回 201。
+	now := time.Now().UTC()
+	repo := &paymentOrdersTestRepo{item: &domainpayment.Payment{
+		RegistrationID: 1001,
+		OutTradeNo:     "202609080001",
+		Amount:         "80.00",
+		PaymentStatus:  domainpayment.PaymentStatusUnpaid,
+		PrecreateAt:    now,
+		PayDeadline:    now.Add(30 * time.Minute),
+		ExpireAt:       now.Add(35 * time.Minute),
+	}}
+	gateway := &paymentOrdersTestGateway{}
+	router := newPaymentOrdersTestRouter(t, repo, gateway)
+
+	t.Run("ROOT 管理端令牌成功创建", func(t *testing.T) {
+		token := signPaymentOrdersAccessToken(t, domainauth.RealmMis)
+		w := performPaymentOrdersCreate(router, token, body)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201; body=%s", w.Code, w.Body.String())
+		}
+		if location := w.Header().Get("Location"); location != "/api/v1/payments/202609080001" {
+			t.Fatalf("Location = %q，期望 /api/v1/payments/202609080001", location)
+		}
+		if len(gateway.precreateCalls) != 1 {
+			t.Fatalf("预下单调用次数 = %d，期望 1", len(gateway.precreateCalls))
+		}
+		if len(repo.regQueries) != 1 || repo.regQueries[0] != 0 {
+			t.Fatalf("仓储归属入参 = %v，期望管理端传 0（不限定归属）", repo.regQueries)
+		}
+	})
+
+	t.Run("非 ROOT 管理端令牌被拒", func(t *testing.T) {
+		nonRootRouter, nonRootToken := newRealmTestRouter(t, domainauth.RealmMis)
+		w := performPaymentOrdersCreate(nonRootRouter, nonRootToken, body)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403; body=%s", w.Code, w.Body.String())
+		}
+		if code := decodeRealmRouterBody(t, w)["code"]; code != "AUTH_FORBIDDEN" {
+			t.Fatalf("code = %v, want AUTH_FORBIDDEN", code)
+		}
+	})
+
+	t.Run("患者令牌因 realm 不匹配被拒", func(t *testing.T) {
+		patientRouter, patientToken := newRealmTestRouter(t, domainauth.RealmPatient)
+		w := performPaymentOrdersCreate(patientRouter, patientToken, body)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401; body=%s", w.Code, w.Body.String())
+		}
+		if code := decodeRealmRouterBody(t, w)["code"]; code != "AUTH_INVALID_TOKEN" {
+			t.Fatalf("code = %v, want AUTH_INVALID_TOKEN", code)
+		}
+	})
+
+	t.Run("无令牌被拒", func(t *testing.T) {
+		w := performPaymentOrdersCreate(router, "", body)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401; body=%s", w.Code, w.Body.String())
+		}
+		if code := decodeRealmRouterBody(t, w)["code"]; code != "AUTH_INVALID_TOKEN" {
+			t.Fatalf("code = %v, want AUTH_INVALID_TOKEN", code)
+		}
+	})
 }

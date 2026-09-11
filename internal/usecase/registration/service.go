@@ -11,10 +11,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
 	"time"
 
 	domainauth "Medical-Web-Backend/internal/domain/auth"
 	"Medical-Web-Backend/internal/domain/patient"
+	domainpayment "Medical-Web-Backend/internal/domain/payment"
 	domainregistration "Medical-Web-Backend/internal/domain/registration"
 	"Medical-Web-Backend/internal/port"
 )
@@ -29,6 +32,10 @@ const (
 	CodeRegistrationNotFound = "REGISTRATION_NOT_FOUND"
 	// CodeDependencyUnavailable 表示仓储（PostgreSQL）不可用，映射为 502 DEPENDENCY_UNAVAILABLE。
 	CodeDependencyUnavailable = "DEPENDENCY_UNAVAILABLE"
+	// CodePaymentProviderUnavailable 表示建单事务提交后的支付宝预下单或二维码回写失败：
+	// 订单已按业务说明第 3.3 节执行整单补偿（删除订单 + 两级号源回退），映射为
+	// 502 PAYMENT_PROVIDER_UNAVAILABLE，可重试且不返回二维码（契约 §6.2）。
+	CodePaymentProviderUnavailable = "PAYMENT_PROVIDER_UNAVAILABLE"
 )
 
 // PaymentMethodAlipay 是本阶段唯一支持的支付方式（契约 §6.2、§6.5、§12.4）。
@@ -113,12 +120,23 @@ type CreateInput struct {
 	PaymentMethod string
 }
 
+// CreateResult 是建单结果：挂号资源 + 同一次 HTTP 请求内完成的预下单支付参数（契约 §6.2）。
+//
+// 订单与预下单不再分离：建单事务提交后立即预下单，Payment 携带的 precreate_at、
+// pay_deadline（+30 分钟）与 expire_at（+35 分钟）就是建单 INSERT 写定的一组时间点，
+// 二维码（PrepayID）与订单有效期因此同起点（创建订单与支付业务说明.md 第 2、3 节）。
+type CreateResult struct {
+	Registration domainregistration.Registration
+	Payment      domainpayment.Payment
+}
+
 // Service 编排挂号域用例。cards 提供就诊卡归属判定，patients 提供持卡账号状态，
-// repo 提供挂号读写与事务内的号源扣减。
+// repo 提供挂号读写与事务内的号源扣减，precreator 提供建单后的支付宝预下单能力。
 type Service struct {
-	repo     port.RegistrationRepository
-	cards    port.PatientCardRepository
-	patients port.PatientUserRepository
+	repo       port.RegistrationRepository
+	cards      port.PatientCardRepository
+	patients   port.PatientUserRepository
+	precreator port.PaymentPrecreator
 	// now 可注入，用于确定性地验证时段是否已开始与占用判定。
 	now func() time.Time
 	// newTradeNo 生成外部交易号，可注入以便测试固化格式。
@@ -126,10 +144,14 @@ type Service struct {
 }
 
 // NewService 构造挂号用例；now 为空时回退到当前 UTC 时间。
+//
+// precreator 由 usecase/payment 实现（port.PaymentPrecreator），建单成功提交后立即调用；
+// 缺失时建单直接失败，不允许降级为「先建单、稍后再取码」（业务说明第 3.3 节）。
 func NewService(
 	repo port.RegistrationRepository,
 	cards port.PatientCardRepository,
 	patients port.PatientUserRepository,
+	precreator port.PaymentPrecreator,
 	now func() time.Time,
 ) *Service {
 	if now == nil {
@@ -139,6 +161,7 @@ func NewService(
 		repo:       repo,
 		cards:      cards,
 		patients:   patients,
+		precreator: precreator,
 		now:        now,
 		newTradeNo: domainregistration.NewOutTradeNo,
 	}
@@ -233,18 +256,19 @@ func (s *Service) Eligibility(
 	return domainregistration.NewEligibility(remaining, &amount, reasons), nil
 }
 
-// Create 创建挂号与待支付信息（契约 §6.2）。幂等由 handler 的幂等键协调完成，
-// 本层只负责业务规则：归属、患者状态、时段资格、占用判重与号源扣减。
+// Create 创建挂号并即时完成支付预下单（契约 §6.2）。幂等由 handler 的幂等键协调完成，
+// 本层负责业务规则：归属、患者状态、时段资格、占用判重、号源扣减，以及在**建单事务提交后**
+// 于同一个 HTTP 请求内调用支付宝预下单并回写二维码（创建订单与支付业务说明.md 第 3.1 节）。
 //
-// 切片边界：契约 §6.2 的事务步骤还列有「调用支付 adapter 预下单」，该步骤的实现
-// 属于支付切片（§6.5）的范围，本切片只落业务字段 + payment_status=1(UNPAID)，
-// prepay_id/transaction_id 置空；客户端随后调用 POST /api/v1/payments 取支付参数。
-// 这与 §12.4 的建单响应示例一致（示例中不含任何支付参数）。
+// 事务边界：预下单是外部网络调用，必须发生在数据库事务之外，否则占号行的并发挂号会被串行化、
+// 事务时长也会绑到支付宝的尾延迟上；预下单或二维码回写失败时执行整单补偿（删除订单 +
+// 两级号源回退）并返回 502 PAYMENT_PROVIDER_UNAVAILABLE，不向客户端返回二维码
+// （业务说明第 3.2、3.3 节）。
 func (s *Service) Create(
 	ctx context.Context,
 	actor Actor,
 	input CreateInput,
-) (*domainregistration.Registration, error) {
+) (*CreateResult, error) {
 	if err := s.ready(); err != nil {
 		return nil, err
 	}
@@ -256,6 +280,12 @@ func (s *Service) Create(
 	}
 	if err := validatePaymentMethod(input.PaymentMethod); err != nil {
 		return nil, err
+	}
+	// 支付能力缺失属于启动期装配错误：预下单不可能成功，直接返回 502，不建单也不占号，
+	// 避免留下「占用号源但没有二维码」的订单（业务说明第 3.3 节）。
+	// 放在入参校验之后，保证非法入参仍优先返回 422。
+	if s.precreator == nil {
+		return nil, paymentUnavailableError()
 	}
 
 	now := s.now()
@@ -280,7 +310,41 @@ func (s *Service) Create(
 	if err != nil {
 		return nil, s.createError(err, input.ScheduleID)
 	}
-	return created, nil
+	// 建单事务已提交，随后在同一 HTTP 请求内完成预下单（业务说明第 3.1 节第 5~6 步）。
+	pay, err := s.precreateForOrder(ctx, created)
+	if err != nil {
+		return nil, err
+	}
+	return &CreateResult{Registration: *created, Payment: *pay}, nil
+}
+
+// precreateForOrder 在建单事务提交后执行预下单；任何失败都按业务说明第 3.3 节执行整单补偿，
+// 并统一映射为 502 PAYMENT_PROVIDER_UNAVAILABLE（契约 §6.2）。
+//
+// 允许删除订单记录的前提是二维码从未交付给客户端：本函数只在二维码确实落库时才返回成功，
+// 因此失败路径上不存在「用户可能已付款、记录却已被删除」的情况。补偿本身失败必须告警，
+// 不允许静默留下「占用号源但没有订单」的状态。
+func (s *Service) precreateForOrder(
+	ctx context.Context,
+	created *domainregistration.Registration,
+) (*domainpayment.Payment, error) {
+	pay, err := s.precreator.PrecreateForOrder(ctx, created.ID)
+	switch {
+	case err != nil:
+		log.Printf("告警：建单预下单失败，执行整单补偿 registration_id=%d out_trade_no=%s: %v",
+			created.ID, created.OutTradeNo, err)
+	case pay == nil || strings.TrimSpace(pay.PrepayID) == "":
+		// 拿不到二维码就不能交付 201：没有支付凭证的建单必须整体撤销。
+		log.Printf("告警：建单预下单未取得二维码，执行整单补偿 registration_id=%d out_trade_no=%s",
+			created.ID, created.OutTradeNo)
+	default:
+		return pay, nil
+	}
+	if compErr := s.repo.CompensateRegistration(ctx, created.ID); compErr != nil {
+		log.Printf("告警：建单整单补偿失败，可能残留占用号源的订单 registration_id=%d out_trade_no=%s: %v",
+			created.ID, created.OutTradeNo, compErr)
+	}
+	return nil, paymentUnavailableError()
 }
 
 // List 返回挂号分页列表（契约 §6.3）：管理端按过滤条件查询，患者端只返回本人记录。
@@ -573,4 +637,14 @@ func duplicateError() error {
 
 func registrationNotFoundError() error {
 	return &ServiceError{Code: CodeRegistrationNotFound, Message: "挂号记录不存在"}
+}
+
+// paymentUnavailableError 是建单预下单失败后的统一对外错误（契约 §6.2）：订单已完成整单补偿，
+// 用户重新发起挂号会生成新的 out_trade_no，因此文案引导重新挂号；支付宝 sub_code 与 provider
+// 原文只进日志，绝不出现在响应里。
+func paymentUnavailableError() error {
+	return &ServiceError{
+		Code:    CodePaymentProviderUnavailable,
+		Message: "支付渠道暂时不可用，请稍后重新发起挂号",
+	}
 }

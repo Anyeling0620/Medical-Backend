@@ -31,7 +31,7 @@ func NewPostgresRegistrationRepository(db *sql.DB) *PostgresRegistrationReposito
 // 由 formatDoctorPrice 统一为两位小数，避免浮点误差。
 const registrationColumns = `r.id, r.patient_card_id, r.work_plan_id, r.doctor_schedule_id, r.doctor_id, r.dept_sub_id,
 r.date::text, r.slot, r.amount::text, btrim(r.out_trade_no) AS out_trade_no,
-r.payment_status, r.create_time::text`
+r.payment_status, r.create_time::text, r.pay_deadline, r.expire_at`
 
 // registrationListFrom 是列表与计数共用的固定来源（别名为 r，供 registrationWhere 使用）。
 const registrationListFrom = ` FROM hospital.medical_registration r`
@@ -181,6 +181,82 @@ func (r *PostgresRegistrationRepository) CreateRegistration(
 	return created, nil
 }
 
+// compensateRegistrationQuery 读取补偿所需的关联与状态，并锁住该挂号行：
+// work_plan_id 与 doctor_schedule_id 用于把两级 num 各减 1，payment_status 用于确认
+// 订单仍未收款（只有未付款的订单才允许删除，契约 §6.2、业务说明第 3.3 节）。
+const compensateRegistrationQuery = `SELECT work_plan_id, doctor_schedule_id, payment_status
+FROM hospital.medical_registration WHERE id = $1 FOR UPDATE`
+
+// deleteRegistrationQuery 删除已确认可补偿的挂号记录；payment_status 条件保证
+// 并发下不会删掉已经收款的订单。
+const deleteRegistrationQuery = `DELETE FROM hospital.medical_registration
+WHERE id = $1 AND payment_status = $2`
+
+// releasePlanQuotaQuery / releaseSlotQuotaQuery 把两级号源各减 1；num > 0 保护保证
+// 计数器不会被减成负数（契约 §6.2、业务说明第 4 节）。
+const (
+	releasePlanQuotaQuery = `UPDATE hospital.doctor_work_plan SET num = num - 1 WHERE id = $1 AND num > 0`
+	releaseSlotQuotaQuery = `UPDATE hospital.doctor_work_plan_schedule SET num = num - 1 WHERE id = $1 AND num > 0`
+)
+
+// CompensateRegistration 执行建单失败补偿：删除该挂号记录，并在同一事务内按
+// 「计划级 -> 时段级」顺序把两级 num 各减 1（带 num > 0 保护）。
+//
+// 幂等语义：记录已不存在（重复补偿，或已被其它路径清理）时按成功返回；记录仍存在但已不是
+// 未付款状态时返回 registration.ErrCompensationRefused，绝不删除可能已收款的订单，由调用方
+// 告警并人工介入（契约 §6.2、创建订单与支付业务说明.md 第 3.3 节）。
+//
+// 加锁顺序：先锁该挂号行（FOR UPDATE），再按「父计划 -> 时段」顺序更新两级计数器；
+// 与 createRegistrationTx 对计划/时段的加锁顺序一致，避免与并发建单互相死锁。
+func (r *PostgresRegistrationRepository) CompensateRegistration(
+	ctx context.Context,
+	registrationID int64,
+) error {
+	if r == nil || r.db == nil {
+		return sql.ErrConnDone
+	}
+	if registrationID < 1 {
+		return fmt.Errorf("registration id must be positive: %d", registrationID)
+	}
+	return r.withRegistrationTx(ctx, func(tx *sql.Tx) error {
+		var (
+			workPlanID   int64
+			scheduleID   int64
+			paymentState sql.NullInt16
+		)
+		err := tx.QueryRowContext(ctx, compensateRegistrationQuery, registrationID).
+			Scan(&workPlanID, &scheduleID, &paymentState)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !paymentState.Valid || paymentState.Int16 != registration.PaymentCodeUnpaid {
+			return registration.ErrCompensationRefused
+		}
+		deleted, err := tx.ExecContext(ctx, deleteRegistrationQuery,
+			registrationID, registration.PaymentCodeUnpaid)
+		if err != nil {
+			return err
+		}
+		if affected, err := deleted.RowsAffected(); err != nil {
+			return err
+		} else if affected == 0 {
+			// 防御性兜底：本事务已持有该行锁且上面校验过状态，正常不可达；
+			// 一旦命中说明行被外部路径改写，不做任何号源回退。
+			return registration.ErrCompensationRefused
+		}
+		if _, err := tx.ExecContext(ctx, releasePlanQuotaQuery, workPlanID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, releaseSlotQuotaQuery, scheduleID); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
 // createRegistrationTx 是建单事务的完整步骤，失败时由调用方回滚整单。
 func createRegistrationTx(
 	ctx context.Context,
@@ -292,13 +368,19 @@ FROM hospital.doctor_work_plan WHERE id = $1 FOR UPDATE`,
 		return nil, err
 	}
 
-	// 7. 插入挂号记录：payment_status=1（UNPAID），create_time 写业务日历日。
+	// 7. 插入挂号记录：payment_status=1（UNPAID），create_time 写业务日历日；
+	//    三个支付时间点必须在同一条 INSERT 内由数据库 now() 计算：precreate_at 为预下单
+	//    基准时刻，pay_deadline = precreate_at + 30 分钟，expire_at = precreate_at + 35 分钟。
+	//    now() 是事务时间戳，同一事务内取值一致；禁止使用应用进程时间或 clock_timestamp()，
+	//    也禁止在代码里用「常量 + 运行时偏移」重新推导（契约 §6.2、
+	//    创建订单与支付业务说明.md 第 2 节）。
 	createDate := registration.BusinessDate(input.Now)
 	var registrationID int64
 	err = tx.QueryRowContext(ctx,
 		`INSERT INTO hospital.medical_registration
-(id, patient_card_id, work_plan_id, doctor_schedule_id, doctor_id, dept_sub_id, date, slot, amount, out_trade_no, prepay_id, transaction_id, payment_status, create_time)
-VALUES (nextval('hospital.medical_registration_sequence'), $1, $2, $3, $4, $5, $6::date, $7, $8::numeric, $9, NULL, NULL, $10, $11::date)
+(id, patient_card_id, work_plan_id, doctor_schedule_id, doctor_id, dept_sub_id, date, slot, amount, out_trade_no, prepay_id, transaction_id, payment_status, create_time, precreate_at, pay_deadline, expire_at)
+VALUES (nextval('hospital.medical_registration_sequence'), $1, $2, $3, $4, $5, $6::date, $7, $8::numeric, $9, NULL, NULL, $10, $11::date,
+        now(), now() + interval '30 minutes', now() + interval '35 minutes')
 RETURNING id`,
 		input.PatientCardID, workPlanID, input.ScheduleID, doctorID, subdepartmentID,
 		date, nullInt16(slot), amount, strings.TrimSpace(input.OutTradeNo),
@@ -511,11 +593,13 @@ func scanRegistration(scanner registrationScanner) (registration.Registration, e
 		amount        sql.NullString
 		outTradeNo    sql.NullString
 		createDate    sql.NullString
+		payDeadline   sql.NullTime
+		expireAt      sql.NullTime
 	)
 	if err := scanner.Scan(
 		&item.ID, &item.PatientCardID, &item.WorkPlanID, &item.ScheduleID,
 		&item.DoctorID, &item.SubdepartmentID, &item.Date, &slot,
-		&amount, &outTradeNo, &paymentStatus, &createDate,
+		&amount, &outTradeNo, &paymentStatus, &createDate, &payDeadline, &expireAt,
 	); err != nil {
 		return registration.Registration{}, err
 	}
@@ -524,6 +608,13 @@ func scanRegistration(scanner registrationScanner) (registration.Registration, e
 	item.OutTradeNo = outTradeNo.String
 	item.PaymentStatus = registration.PaymentStatusLabel(nullInt16(paymentStatus))
 	item.CreateDate = createDate.String
+	// 两个支付截止时刻可能为空（历史数据）：保持零值，由响应层序列化为空串。
+	if payDeadline.Valid {
+		item.PayDeadline = payDeadline.Time
+	}
+	if expireAt.Valid {
+		item.ExpireAt = expireAt.Time
+	}
 	return item, nil
 }
 

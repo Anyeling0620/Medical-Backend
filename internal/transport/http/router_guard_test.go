@@ -135,19 +135,32 @@ var patientRealmExemptPrefixes = []string{
 	"/api/v1/payments",
 }
 
+// patientRealmAdminOnlyPaths 记录虽落在患者域豁免前缀内、但只允许管理端访问的路径：
+// 这些路径必须参与「患者令牌被拒」的遍历断言，不能被前缀豁免跳过。
+//
+// 创建支付订单接口（POST /api/v1/payments/orders）挂在 /api/v1/payments 前缀下，
+// 但按契约 §6.9 只有 ROOT 管理端令牌可以调用，患者令牌必须返回 401 AUTH_INVALID_TOKEN。
+var patientRealmAdminOnlyPaths = map[string]bool{
+	"/api/v1/payments/orders": true,
+}
+
 // TestRouterNonPatientRoutesRejectPatientRealmToken 遍历整张路由表，断言除公开白名单
-// 与患者域前缀外的每条路由都拒绝 realm=patient 的合法令牌（401 AUTH_INVALID_TOKEN）。
+// 与患者域前缀（patientRealmAdminOnlyPaths 里的管理端专用路径除外）外的每条路由
+// 都拒绝 realm=patient 的合法令牌（401 AUTH_INVALID_TOKEN）。
 // 与匿名遍历相比，本用例用「签名正确但 realm 不对」的令牌进一步排除
 // 「路由漏挂 realm 门禁、仅靠 claims 缺失兜底」的情况。
 func TestRouterNonPatientRoutesRejectPatientRealmToken(t *testing.T) {
 	router, patientToken := newRealmTestRouter(t, domainauth.RealmPatient)
 
 	checked := 0
+	seenAdminOnly := make(map[string]bool, len(patientRealmAdminOnlyPaths))
 	for _, route := range router.Routes() {
 		if anonymousAllowedRoutePaths[route.Path] {
 			continue
 		}
-		if hasExemptPrefix(route.Path, patientRealmExemptPrefixes) {
+		if patientRealmAdminOnlyPaths[route.Path] {
+			seenAdminOnly[route.Path] = true
+		} else if hasExemptPrefix(route.Path, patientRealmExemptPrefixes) {
 			continue
 		}
 
@@ -193,6 +206,13 @@ func TestRouterNonPatientRoutesRejectPatientRealmToken(t *testing.T) {
 	if checked < 16 {
 		t.Errorf("被检查的非患者域路由数 = %d, want >= 16", checked)
 	}
+
+	// 管理端专用路径必须真实存在，否则清单会静默失效、用例形同虚设。
+	for path := range patientRealmAdminOnlyPaths {
+		if !seenAdminOnly[path] {
+			t.Errorf("管理端专用路径 %s 不在路由表中，请同步维护该清单", path)
+		}
+	}
 }
 
 // hasExemptPrefix 判断路由模板路径是否落在任一豁免前缀下。
@@ -233,5 +253,26 @@ func TestRouterAlipayNotifyReachableAnonymously(t *testing.T) {
 		if body["code"] == "AUTH_INVALID_TOKEN" {
 			t.Fatalf("匿名通知被令牌中间件拦截：code=%v; body=%s", body["code"], w.Body.String())
 		}
+	}
+}
+
+// TestRouterPaymentOrdersRejectsPatientRealmToken 单列创建支付订单接口的患者令牌断言
+// （契约 §1.2、§6.9）：该路径落在 /api/v1/payments 患者域豁免前缀内，但只有 ROOT 管理端
+// 可以调用，患者令牌必须在 realm 校验阶段返回 401 AUTH_INVALID_TOKEN，
+// 不能被前缀豁免规则静默放过（遍历用例用 patientRealmAdminOnlyPaths 覆盖同一断言）。
+func TestRouterPaymentOrdersRejectsPatientRealmToken(t *testing.T) {
+	router, patientToken := newRealmTestRouter(t, domainauth.RealmPatient)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/payments/orders", strings.NewReader(`{"registrationId":1001}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+patientToken)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("患者令牌访问创建支付订单接口 status = %d, want 401; body=%s", w.Code, w.Body.String())
+	}
+	if code := decodeRealmRouterBody(t, w)["code"]; code != "AUTH_INVALID_TOKEN" {
+		t.Fatalf("code = %v, want AUTH_INVALID_TOKEN", code)
 	}
 }

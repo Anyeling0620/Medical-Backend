@@ -31,6 +31,14 @@ type RegistrationRepository interface {
 	// registration.ErrDuplicate，时段已开始返回 registration.ErrScheduleStarted，
 	// 医生不在诊返回 registration.ErrDoctorInactive。
 	CreateRegistration(ctx context.Context, input registration.CreateInput) (*registration.Registration, error)
+	// CompensateRegistration 执行建单失败补偿：删除该挂号记录，并在同一事务内按
+	// 「计划级 -> 时段级」顺序把两级 num 各减 1（带 num > 0 保护）。
+	//
+	// 建单流程需要先提交事务拿到 out_trade_no，才能在同一 HTTP 请求内调用支付宝预下单；
+	// 预下单失败时用本方法把订单与已占用号源一并撤销（契约 §6.2、业务说明第 3.3 节）。
+	// 幂等：记录已不存在时按成功返回；记录存在但已不是未付款状态时返回
+	// registration.ErrCompensationRefused，调用方必须告警，不得吞掉该错误。
+	CompensateRegistration(ctx context.Context, registrationID int64) error
 	// ListRegistrations 按过滤条件分页返回挂号记录，并按 f.Sort/f.Order 排序，返回总数。
 	// 调用方必须先按契约 §1.4 校验 page/pageSize 再换算 offset/limit。
 	ListRegistrations(ctx context.Context, f registration.Filter, offset, limit int) ([]registration.Registration, int64, error)
