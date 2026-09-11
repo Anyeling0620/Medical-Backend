@@ -35,3 +35,27 @@ func BindPaymentRead(c *gin.Context) (PaymentReadRequest, error) {
 	}
 	return body, nil
 }
+
+// PaymentCreateRequest 是 POST /api/v1/payments/orders 的请求体（契约 §6.9、§12.4）。
+//
+// 与取支付参数一样用指针承载 registrationId：nil 表示请求未提交该字段，
+// 可据此与「提交了 0」区分，给出「必传字段」而不是「取值为 0」的提示。
+type PaymentCreateRequest struct {
+	RegistrationID *int64 `json:"registrationId"`
+}
+
+// BindPaymentCreate 严格解析创建支付订单请求体：拒绝未知字段与多余内容，
+// registrationId 为必传且必须为正整数。
+func BindPaymentCreate(c *gin.Context) (PaymentCreateRequest, error) {
+	var body PaymentCreateRequest
+	if err := decodeStrict(c, &body); err != nil {
+		return body, err
+	}
+	if body.RegistrationID == nil {
+		return body, errors.New("registrationId 为必传字段")
+	}
+	if *body.RegistrationID < 1 {
+		return body, errors.New("registrationId 必须为正整数")
+	}
+	return body, nil
+}

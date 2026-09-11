@@ -1,5 +1,5 @@
-// Package payment 实现支付域用例：取支付参数（契约 §6.5）、查询支付状态（§6.6）
-// 与支付宝异步通知处理（§6.7）。
+// Package payment 实现支付域用例：创建支付订单（契约 §6.9）、取支付参数（§6.5）、
+// 查询支付状态（§6.6）与支付宝异步通知处理（§6.7）。
 //
 // 支付信息寄存在挂号记录上，本包负责：支付窗口判定、预下单（最小闭环阶段的过渡实现）、
 // 兜底主动查询、通知验签后的金额校验与状态迁移编排。状态迁移与号源占用的原子性由
@@ -30,6 +30,11 @@ const (
 	CodeProviderUnavailable    = "PAYMENT_PROVIDER_UNAVAILABLE"
 	// CodeDependencyUnavailable 表示仓储（PostgreSQL）不可用，映射为 502 DEPENDENCY_UNAVAILABLE。
 	CodeDependencyUnavailable = "DEPENDENCY_UNAVAILABLE"
+	// CodePaymentAlreadyPaid / CodePaymentInvalidTransition 是创建支付订单（§6.9）在终态订单
+	// 上的冲突错误：已支付返回 PAYMENT_ALREADY_PAID，已过期或已退款返回 PAYMENT_INVALID_TRANSITION，
+	// 两者都映射为 409，且都不做状态迁移（契约 §6.8、§9、§10）。
+	CodePaymentAlreadyPaid       = "PAYMENT_ALREADY_PAID"
+	CodePaymentInvalidTransition = "PAYMENT_INVALID_TRANSITION"
 )
 
 // PaymentMethodAlipay 是本阶段唯一支持的支付方式：其他取值（含历史示例中的 WECHAT）
@@ -139,6 +144,7 @@ type ReadResult struct {
 // 契约语义是「只读、不调用支付宝」。本阶段建单流程（§6.2）尚未接入预下单，因此
 // prepay_id 为空时由本接口补做一次 alipay.trade.precreate 并回写，形成可用的最小闭环；
 // 建单接入预下单后 prepay_id 已由建单写入，本分支不再触发，接口自动退化为契约的纯读取语义。
+// 补做逻辑与创建支付订单接口（§6.9）共用 ensurePaymentOrder，禁止各写一套。
 func (s *Service) ReadPayable(
 	ctx context.Context,
 	actor Actor,
@@ -166,26 +172,12 @@ func (s *Service) ReadPayable(
 		return nil, dataError(err)
 	}
 
-	// 最小闭环：建单流程（§6.2）尚未写支付窗口与预下单结果，以上任一缺失都在这里补齐；
-	// 建单接入后两个判定都不会命中，本接口即退化为契约 §6.5 的纯读取语义。
-	//
-	// EnsurePaymentWindow 内部用 out_trade_no 定位订单，不重复做归属校验：
-	// 订单归属已由上面的 FindPaymentByRegistrationID 按当前患者限定过。
+	// 支付窗口或二维码缺失时补齐：与创建支付订单接口（§6.9）共用同一段实现。
+	// ensurePaymentOrder 内部用 out_trade_no 定位订单，订单归属已由上面的
+	// FindPaymentByRegistrationID 按当前患者限定过，这里不重复做归属校验。
 	if item.PrepayID == "" || item.PayDeadline.IsZero() || item.ExpireAt.IsZero() {
-		item, err = s.payments.EnsurePaymentWindow(ctx, item.OutTradeNo)
-		if errors.Is(err, domainpayment.ErrPaymentNotFound) {
-			return nil, notFoundError()
-		}
-		if err != nil {
-			return nil, dataError(err)
-		}
-		// 只有「确实还没有二维码」时才预下单：prepay_id 已存在但时间点缺失属于脏数据，
-		// 补窗口后直接回读已有二维码即可，重复预下单会被支付宝判为交易已存在（不可重试冲突）。
-		if item.PaymentStatus == domainpayment.PaymentStatusUnpaid &&
-			item.PrepayID == "" && !s.now().After(item.PayDeadline) {
-			if item, err = s.precreate(ctx, item); err != nil {
-				return nil, err
-			}
+		if item, _, err = s.ensurePaymentOrder(ctx, item); err != nil {
+			return nil, err
 		}
 	}
 	return &ReadResult{Payment: *item, Payable: item.Payable(s.now())}, nil
@@ -346,13 +338,19 @@ func (s *Service) HandleNotify(ctx context.Context, form map[string][]string) (*
 	return &NotifyOutcome{Marked: true}, nil
 }
 
-// precreate 调用支付宝预下单并回写二维码；失败时不得把二维码交付给客户端（契约 §3.2）。
+// precreate 调用支付宝预下单并回写二维码；拿不到本地落库凭证时不得把二维码交付给
+// 客户端（创建订单与支付业务说明.md 第 3.2 节）。预下单失败与回写失败分别映射为
+// PAYMENT_PROVIDER_UNAVAILABLE 与 DEPENDENCY_UNAVAILABLE，两种情况都不返回二维码。
+//
+// 返回值 wrote 表示本次调用是否真正写入了二维码：false 说明并发请求已先行写入，
+// 返回的是按 out_trade_no 回读到的整行最新数据，不是本条调用产生的支付宝交易，
+// 调用方不得据此判定「新建成功」（创建支付订单接口据此区分 201 与 200，契约 §6.9）。
 func (s *Service) precreate(
 	ctx context.Context,
 	item *domainpayment.Payment,
-) (*domainpayment.Payment, error) {
+) (*domainpayment.Payment, bool, error) {
 	if s.gateway == nil {
-		return nil, providerUnavailableError()
+		return nil, false, providerUnavailableError()
 	}
 	result, err := s.gateway.Precreate(ctx, domainpayment.PrecreateRequest{
 		OutTradeNo:     item.OutTradeNo,
@@ -362,22 +360,22 @@ func (s *Service) precreate(
 		NotifyURL:      s.cfg.NotifyURL,
 	})
 	if err != nil {
-		return nil, providerError(err, "预下单", item.OutTradeNo)
+		return nil, false, providerError(err, "预下单", item.OutTradeNo)
 	}
 	if strings.TrimSpace(result.QRCode) == "" {
-		return nil, providerUnavailableError()
+		return nil, false, providerUnavailableError()
 	}
 	if len(result.QRCode) > maxPrepayIDLength {
 		log.Printf(
 			"告警：支付宝预下单二维码长度 %d 超过 prepay_id 列宽 %d，无法落库 out_trade_no=%s",
 			len(result.QRCode), maxPrepayIDLength, item.OutTradeNo)
-		return nil, providerUnavailableError()
+		return nil, false, providerUnavailableError()
 	}
 	saved, err := s.payments.SavePrepayID(ctx, item.OutTradeNo, result.QRCode)
 	if err != nil {
 		// 回写失败：本地没有对应二维码记录，绝不能把二维码返回给客户端。
 		log.Printf("告警：回写支付宝预下单二维码失败 out_trade_no=%s: %v", item.OutTradeNo, err)
-		return nil, dataError(err)
+		return nil, false, dataError(err)
 	}
 	if !saved {
 		// 并发请求已先行写入二维码：回读库中的值作为响应，
@@ -385,17 +383,18 @@ func (s *Service) precreate(
 		stored, err := s.payments.FindPaymentByOutTradeNo(ctx, item.OutTradeNo, 0)
 		if err != nil {
 			log.Printf("告警：回读支付宝预下单二维码失败 out_trade_no=%s: %v", item.OutTradeNo, err)
-			return nil, dataError(err)
+			return nil, false, dataError(err)
 		}
 		if strings.TrimSpace(stored.PrepayID) == "" {
 			log.Printf("告警：预下单二维码未回写且库中无记录 out_trade_no=%s", item.OutTradeNo)
-			return nil, providerUnavailableError()
+			return nil, false, providerUnavailableError()
 		}
-		item.PrepayID = stored.PrepayID
-		return item, nil
+		// 返回整行回读结果而不是只回填二维码：竞争方可能在这段时间把订单改成终态，
+		// 调用方需要基于最新状态决定响应（契约 §6.9）。
+		return stored, false, nil
 	}
 	item.PrepayID = result.QRCode
-	return item, nil
+	return item, true, nil
 }
 
 // logNotifyDrop 输出被丢弃通知的关键字段（仅开发环境开启）：

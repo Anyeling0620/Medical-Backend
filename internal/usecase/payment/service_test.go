@@ -91,11 +91,17 @@ type fakePaymentRepository struct {
 	// 读取结果：订单与故障注入。
 	item    *domainpayment.Payment
 	findErr error
+	// outTradeNoErr 只让「按交易号读取」失败（nil 表示不注入）：
+	// 用于覆盖 CreateOrder 在预下单后重读最新状态时的 404/502 分支，
+	// 此时按挂号编号的首次读取必须仍然成功。
+	outTradeNoErr error
 	// latestItem 是条件更新未生效时重读返回的最新状态（nil 表示沿用 item）。
 	latestItem *domainpayment.Payment
 	// outTradeNoItem 是按交易号读取的专属返回（nil 表示沿用 item）。
 	// 用于区分「按挂号编号读取的初始值」与「按交易号回读的值」：预下单并发竞争时，
 	// 初始读取还没有二维码，但回读必须能得到并发请求已写入的那个二维码。
+	// 注意：注入 latestItem 时，第二次及之后的读取优先返回 latestItem（重读语义），
+	// outTradeNoItem 只覆盖首次读取。
 	outTradeNoItem *domainpayment.Payment
 	// 窗口补齐：返回值与故障注入。
 	ensureItem *domainpayment.Payment
@@ -161,16 +167,20 @@ func (r *fakePaymentRepository) FindPaymentByOutTradeNo(
 	ownerPatientID int64,
 ) (*domainpayment.Payment, error) {
 	r.outQueries = append(r.outQueries, findByOutTradeNoCall{outTradeNo, ownerPatientID})
+	if r.outTradeNoErr != nil {
+		return nil, r.outTradeNoErr
+	}
 	if r.findErr != nil {
 		return nil, r.findErr
+	}
+	// 第二次及之后的调用是「重读」：注入 latestItem 时优先返回最新状态。
+	// 这样 isNew=false 的幂等路径若误加重读，就会读到注入的终态而返回 409，用例能立刻发现。
+	if len(r.outQueries) > 1 && r.latestItem != nil {
+		return clonePayment(r.latestItem), nil
 	}
 	// 注入了「按交易号读取」的专属值时必须优先返回，供预下单回读分支断言使用。
 	if r.outTradeNoItem != nil {
 		return clonePayment(r.outTradeNoItem), nil
-	}
-	// 第二次调用是「条件更新未生效」后的重读，返回注入的最新状态。
-	if len(r.outQueries) > 1 && r.latestItem != nil {
-		return clonePayment(r.latestItem), nil
 	}
 	return clonePayment(r.item), nil
 }
@@ -188,8 +198,18 @@ func (r *fakePaymentRepository) EnsurePaymentWindow(_ context.Context, outTradeN
 
 // SavePrepayID 记录回写入参并返回注入的写入结果与故障。
 // saved=false 模拟「并发请求已先行写入二维码」，用于覆盖回读库中已有二维码的分支。
+//
+// saved=true 时同步更新内存订单的 prepay_id，模拟真实仓储「回写成功后按 out_trade_no
+// 能读到刚写入的二维码」的语义：CreateOrder 在 isNew=true 时会重读一次最新状态，
+// 假桩若不同步这次写入，重读就会拿到过时的无码订单。
 func (r *fakePaymentRepository) SavePrepayID(_ context.Context, outTradeNo string, prepayID string) (bool, error) {
 	r.saveCalls = append(r.saveCalls, savePrepayIDCall{outTradeNo, prepayID})
+	if r.saveErr != nil {
+		return r.saveResult, r.saveErr
+	}
+	if r.saveResult && r.item != nil && r.item.OutTradeNo == outTradeNo {
+		r.item.PrepayID = prepayID
+	}
 	return r.saveResult, r.saveErr
 }
 

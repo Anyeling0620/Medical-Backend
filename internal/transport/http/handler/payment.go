@@ -68,6 +68,49 @@ func (h *PaymentHandler) Read(c *gin.Context) {
 	c.JSON(http.StatusOK, response.NewPaymentReadResponse(result.Payment, result.Payable))
 }
 
+// Create 处理 POST /api/v1/payments/orders：为指定挂号创建支付订单（契约 §6.9）。
+//
+// 本接口是支付域的管理端专用例外：只有 ROOT 可以直接调用，患者令牌在令牌校验阶段、
+// 非 ROOT 管理令牌在权限校验阶段被拦下；其他角色的支付订单由建单流程在服务内部
+// 调用同一段用例创建，不经过本接口。
+// 本次真正写入二维码（即新建了支付宝交易）返回 201 并带 Location；
+// 二维码已存在时按幂等语义返回 200 与同一条资源。
+func (h *PaymentHandler) Create(c *gin.Context) {
+	actor, ok := h.actor(c)
+	if !ok {
+		return
+	}
+	body, err := request.BindPaymentCreate(c)
+	if err != nil {
+		// 与取支付参数同一口径：JSON 语法/类型错误与截断的请求体返回 400 REQUEST_INVALID_JSON，
+		// 其余（空体、未知字段、语义错误）仍按 422 REQUEST_VALIDATION_FAILED 处理。
+		if isJSONBindError(err) {
+			h.writeError(c, http.StatusBadRequest, codeInvalidJSON, "请求体不是合法的 JSON")
+			return
+		}
+		h.validation(c, err)
+		return
+	}
+	result, err := h.service.CreateOrder(c.Request.Context(), actor, paymentservice.CreateOrderInput{
+		RegistrationID: *body.RegistrationID,
+	})
+	if err != nil {
+		h.writeServiceError(c, err)
+		return
+	}
+	if result == nil {
+		h.internal(c)
+		return
+	}
+	status := http.StatusOK
+	if result.Created {
+		// 创建成功：201 + Location 指向该支付订单的查询地址（契约 §1.3、§6.9）。
+		status = http.StatusCreated
+		c.Header("Location", "/api/v1/payments/"+result.Payment.OutTradeNo)
+	}
+	c.JSON(status, response.NewPaymentReadResponse(result.Payment, result.Payable))
+}
+
 // Detail 处理 GET /api/v1/payments/{outTradeNo}：查询支付状态（契约 §6.6）。
 // 患者端只能查询本人挂号关联的订单，越权与不存在统一返回 404 PAYMENT_NOT_FOUND。
 func (h *PaymentHandler) Detail(c *gin.Context) {
@@ -180,6 +223,8 @@ func paymentStatus(code string) int {
 		return http.StatusBadRequest
 	case paymentservice.CodePaymentNotFound:
 		return http.StatusNotFound
+	case paymentservice.CodePaymentAlreadyPaid, paymentservice.CodePaymentInvalidTransition:
+		return http.StatusConflict
 	case paymentservice.CodeProviderUnavailable, paymentservice.CodeDependencyUnavailable:
 		return http.StatusBadGateway
 	default:

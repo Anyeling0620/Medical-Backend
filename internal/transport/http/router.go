@@ -212,6 +212,15 @@ func NewRouter(
 	paymentHandler := handler.NewPaymentHandler(paymentService)
 	router.POST("/api/v1/payments/alipay/notify", paymentHandler.Notify)
 
+	// 创建支付订单接口（POST /api/v1/payments/orders）是支付域的管理端专用例外：
+	// 只有 ROOT 权限码可以直接调用；患者令牌在令牌校验阶段被拒（realm 不匹配返回 401），
+	// 其他管理端用户在权限校验阶段被拒（403）。建单流程（契约 §6.2）在服务内部调用
+	// 同一段用例创建支付订单，不经过本接口（契约 §1.2、§6.9）。
+	paymentAdminRoutes := router.Group("/api/v1/payments")
+	paymentAdminRoutes.Use(requireMisAccess)
+	paymentAdminRoutes.Use(middleware.RequirePermissions(userRepository, []string{"ROOT"}))
+	paymentAdminRoutes.POST("/orders", paymentHandler.Create)
+
 	paymentRoutes := router.Group("/api/v1/payments")
 	paymentRoutes.Use(middleware.RequireSharedAccess(patientService, service))
 	requirePaymentSelect := middleware.RequirePermissionOrPatient(
