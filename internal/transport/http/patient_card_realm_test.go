@@ -168,6 +168,8 @@ func newPatientCardRealmTestRouter(
 		repo,
 		nil, // wechatAuthenticator
 		nil, // registrationRepository
+		nil, // paymentRepository
+		nil, // alipayGateway
 	)
 
 	claims := &userservice.AccessClaims{

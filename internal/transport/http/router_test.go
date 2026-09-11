@@ -54,6 +54,8 @@ func newContractTestRouter(t *testing.T) *gin.Engine {
 		nil, // patientRepository
 		nil, // wechatAuthenticator
 		nil, // registrationRepository
+		nil, // paymentRepository
+		nil, // alipayGateway
 	)
 }
 
@@ -73,6 +75,8 @@ func newContractTestRouterWithAccessToken(t *testing.T) (*gin.Engine, string) {
 		nil, // patientRepository
 		nil, // wechatAuthenticator
 		nil, // registrationRepository
+		nil, // paymentRepository
+		nil, // alipayGateway
 	)
 
 	claims := &userservice.AccessClaims{
@@ -137,6 +141,10 @@ func TestRouterExposesContractRoutes(t *testing.T) {
 		"POST /api/v1/schedule/plans/:planId/slots",
 		"PATCH /api/v1/schedule/slots/:slotId",
 		"DELETE /api/v1/schedule/slots/:slotId",
+		// 支付域接口（规范第 6 章）
+		"POST /api/v1/payments",
+		"GET /api/v1/payments/:outTradeNo",
+		"POST /api/v1/payments/alipay/notify",
 		// 患者端认证与当前患者（规范第 7 章）
 		"POST /api/v1/patient/auth/wechat-login",
 		"POST /api/v1/patient/auth/refresh",

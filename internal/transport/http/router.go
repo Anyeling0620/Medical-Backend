@@ -15,6 +15,7 @@ import (
 	userservice "Medical-Web-Backend/internal/usecase/misuser"
 	patientauthservice "Medical-Web-Backend/internal/usecase/patientauth"
 	patientcardservice "Medical-Web-Backend/internal/usecase/patientcard"
+	paymentservice "Medical-Web-Backend/internal/usecase/payment"
 	publiccatalogservice "Medical-Web-Backend/internal/usecase/publiccatalog"
 	registrationservice "Medical-Web-Backend/internal/usecase/registration"
 	scheduleservice "Medical-Web-Backend/internal/usecase/schedule"
@@ -32,6 +33,8 @@ func NewRouter(
 	patientRepository port.PatientRepository,
 	wechatAuthenticator port.WeChatAuthenticator,
 	registrationRepository port.RegistrationRepository,
+	paymentRepository port.PaymentRepository,
+	alipayGateway port.AlipayGateway,
 ) *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
@@ -190,6 +193,33 @@ func NewRouter(
 	registrationRoutes.POST("", requireRegistrationWrite, registrationHandler.Create)
 	registrationRoutes.GET("", requireRegistrationSelect, registrationHandler.List)
 	registrationRoutes.GET("/:registrationId", requireRegistrationSelect, registrationHandler.Detail)
+
+	// 支付域（/api/v1/payments/*）同为双 realm 共享业务接口（契约 §1.2、§6.5–§6.7）。
+	//
+	// 支付宝异步通知入口必须公网可达、且不得落在统一鉴权中间件之后：它不读取任何用户
+	// token，信任来源只有 RSA2 验签，因此单独挂在引擎级路由上（契约 §6.7 部署约束）。
+	// 其余两个接口接受 patient/mis 两种 realm，权限编码用读取类 PAYMENT:SELECT
+	// （契约 §6.5 已把取支付参数降级为幂等读取语义）。
+	paymentService := paymentservice.NewService(
+		paymentRepository,
+		alipayGateway,
+		paymentservice.Config{
+			PaymentSubject:   cfg.Alipay.Subject,
+			NotifyURL:        cfg.Alipay.NotifyURL,
+			LogDroppedNotify: cfg.App.Env == "development",
+		},
+	)
+	paymentHandler := handler.NewPaymentHandler(paymentService)
+	router.POST("/api/v1/payments/alipay/notify", paymentHandler.Notify)
+
+	paymentRoutes := router.Group("/api/v1/payments")
+	paymentRoutes.Use(middleware.RequireSharedAccess(patientService, service))
+	requirePaymentSelect := middleware.RequirePermissionOrPatient(
+		userRepository,
+		[]string{"ROOT", "PAYMENT:SELECT"},
+	)
+	paymentRoutes.POST("", requirePaymentSelect, paymentHandler.Read)
+	paymentRoutes.GET("/:outTradeNo", requirePaymentSelect, paymentHandler.Detail)
 
 	return router
 }
