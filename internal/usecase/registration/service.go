@@ -49,6 +49,12 @@ const (
 	maxPageSize = 100
 )
 
+// compensationTimeout 是整单补偿的超时上限。补偿属于请求收尾动作：客户端断开时请求 ctx 会被
+// 取消（net/http 在连接关闭时取消它），而预下单失败往往正是这次取消造成的，因此补偿必须脱离
+// 请求 ctx 的取消信号独立执行（见 precreateForOrder），同时保留上限，避免收尾动作无限挂起
+// （契约 §6.2、创建订单与支付业务说明.md 第 3.3 节）。
+const compensationTimeout = 5 * time.Second
+
 // ErrDependencyUnavailable 表示挂号仓储不可用（连接失败等），映射为
 // 502 DEPENDENCY_UNAVAILABLE。依赖故障不能伪装成「挂号不存在」或「号源已满」，
 // 否则客户端会把可重试的故障当成业务结论（契约 §10）。
@@ -324,6 +330,9 @@ func (s *Service) Create(
 // 允许删除订单记录的前提是二维码从未交付给客户端：本函数只在二维码确实落库时才返回成功，
 // 因此失败路径上不存在「用户可能已付款、记录却已被删除」的情况。补偿本身失败必须告警，
 // 不允许静默留下「占用号源但没有订单」的状态。
+//
+// 补偿不沿用请求 ctx：客户端断开或超时时该 ctx 已被取消，沿用会让补偿事务在发出 SQL 前
+// 就被放弃，号源随幽灵订单一直占用。这里剥离取消信号、只保留 values，并加短超时兜底。
 func (s *Service) precreateForOrder(
 	ctx context.Context,
 	created *domainregistration.Registration,
@@ -340,7 +349,9 @@ func (s *Service) precreateForOrder(
 	default:
 		return pay, nil
 	}
-	if compErr := s.repo.CompensateRegistration(ctx, created.ID); compErr != nil {
+	compCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), compensationTimeout)
+	defer cancel()
+	if compErr := s.repo.CompensateRegistration(compCtx, created.ID); compErr != nil {
 		log.Printf("告警：建单整单补偿失败，可能残留占用号源的订单 registration_id=%d out_trade_no=%s: %v",
 			created.ID, created.OutTradeNo, compErr)
 	}

@@ -78,6 +78,9 @@ type registrationFakeRepo struct {
 
 	compensateCalls  int
 	lastCompensateID int64
+	// lastCompensateCtxErr 记录补偿入参 ctx 的取消状态（nil 表示未取消），用于回归断言
+	// 「补偿已脱离请求 ctx 的取消信号」（创建订单与支付业务说明.md 第 3.3 节）。
+	lastCompensateCtxErr error
 }
 
 func (r *registrationFakeRepo) FindScheduleSnapshot(
@@ -143,11 +146,12 @@ func (r *registrationFakeRepo) CreateRegistration(
 
 // CompensateRegistration 记录补偿入参并返回注入的故障，供建单预下单失败用例断言。
 func (r *registrationFakeRepo) CompensateRegistration(
-	_ context.Context,
+	ctx context.Context,
 	registrationID int64,
 ) error {
 	r.compensateCalls++
 	r.lastCompensateID = registrationID
+	r.lastCompensateCtxErr = ctx.Err()
 	return r.compensateErr
 }
 
@@ -1174,6 +1178,34 @@ func TestCreatePrecreateFailureCompensates(t *testing.T) {
 		assertServiceError(t, err, CodePaymentProviderUnavailable)
 		if env.repo.compensateCalls != 1 {
 			t.Errorf("空二维码必须补偿一次，实际 %d 次", env.repo.compensateCalls)
+		}
+	})
+
+	t.Run("请求 ctx 已取消：补偿仍脱离取消信号执行", func(t *testing.T) {
+		// 回归：客户端断开时 net/http 会取消请求 ctx，而预下单失败往往正是这次取消造成的。
+		// 若补偿沿用请求 ctx（context.WithTimeout(ctx, ...)），补偿事务会在真正发出 SQL 前
+		// 就被放弃，号源随幽灵订单永久占用；因此补偿必须用 context.WithoutCancel 剥离取消信号。
+		env := newRegistrationTestEnv(t)
+		env.precreator.err = errors.New("alipay precreate down")
+
+		canceledCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		created, err := env.service.Create(canceledCtx, patientActor(), CreateInput{
+			PatientCardID: int64Ptr(registrationTestCardID),
+			ScheduleID:    registrationTestScheduleID,
+			PaymentMethod: validPaymentMethod,
+		})
+		if created != nil {
+			t.Errorf("预下单失败不得返回建单结果：%+v", created)
+		}
+		assertServiceError(t, err, CodePaymentProviderUnavailable)
+		if env.repo.compensateCalls != 1 {
+			t.Errorf("CompensateRegistration 调用 %d 次，want 1", env.repo.compensateCalls)
+		}
+		if env.repo.lastCompensateCtxErr != nil {
+			t.Errorf("补偿 ctx 仍带取消信号（ctx.Err()=%v），客户端断开后号源将无法归还",
+				env.repo.lastCompensateCtxErr)
 		}
 	})
 }
