@@ -144,6 +144,7 @@ func newMedicalRecordPermissionRouter(
 		nil, // paymentRepository
 		nil, // alipayGateway
 		repository,
+		nil, // doctorPatientRepository
 	)
 
 	claims := &userservice.AccessClaims{

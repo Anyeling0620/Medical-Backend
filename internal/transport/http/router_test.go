@@ -60,6 +60,7 @@ func newContractTestRouter(t *testing.T) *gin.Engine {
 		nil, // paymentRepository
 		nil, // alipayGateway
 		nil, // medicalRecordRepository
+		nil, // doctorPatientRepository
 	)
 }
 
@@ -82,6 +83,7 @@ func newContractTestRouterWithAccessToken(t *testing.T) (*gin.Engine, string) {
 		nil, // paymentRepository
 		nil, // alipayGateway
 		nil, // medicalRecordRepository
+		nil, // doctorPatientRepository
 	)
 
 	claims := &userservice.AccessClaims{
@@ -457,6 +459,7 @@ func newPaymentOrdersTestRouter(
 		repo,
 		gateway,
 		nil, // medicalRecordRepository
+		nil, // doctorPatientRepository
 	)
 }
 

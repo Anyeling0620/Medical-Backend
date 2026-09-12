@@ -12,6 +12,7 @@ import (
 	"Medical-Web-Backend/internal/repo"
 	"Medical-Web-Backend/internal/transport/http/handler"
 	"Medical-Web-Backend/internal/transport/http/middleware"
+	doctorpatientservice "Medical-Web-Backend/internal/usecase/doctorpatient"
 	medicalrecordservice "Medical-Web-Backend/internal/usecase/medical_record"
 	userservice "Medical-Web-Backend/internal/usecase/misuser"
 	patientauthservice "Medical-Web-Backend/internal/usecase/patientauth"
@@ -37,6 +38,7 @@ func NewRouter(
 	paymentRepository port.PaymentRepository,
 	alipayGateway port.AlipayGateway,
 	medicalRecordRepository port.MedicalRecordRepository,
+	doctorPatientRepository port.DoctorPatientRepository,
 ) *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
@@ -258,6 +260,21 @@ func NewRouter(
 		userRepository, []string{"MEDICAL_RECORD:UPDATE"}), medicalRecordHandler.Update)
 	medicalRecordRoutes.DELETE("/:medicalRecordId", middleware.RequirePermissions(
 		userRepository, []string{"MEDICAL_RECORD:DELETE"}), medicalRecordHandler.Delete)
+	// 医生工作台（/api/v1/mis/doctor/*）：只有登录主体在 mis_user.ref_id 上绑定了
+	// doctor.id 的账号才能查看，且只能看到自己接诊过的患者——数据范围由用例按
+	// 令牌主体推导，与客户端提交的参数无关（契约 §1.2、§6.10）。
+	// 权限编码复用挂号读取权限 REGISTRATION:SELECT（库中「医生」角色已具备），
+	// ROOT 作为超级权限一并放行。
+	doctorPatientHandler := handler.NewDoctorPatientHandler(
+		doctorpatientservice.NewService(userRepository, doctorPatientRepository),
+	)
+	doctorPatientRoutes := router.Group("/api/v1/mis/doctor")
+	doctorPatientRoutes.Use(requireMisAccess)
+	doctorPatientRoutes.Use(middleware.RequirePermissions(
+		userRepository,
+		[]string{"ROOT", "REGISTRATION:SELECT"},
+	))
+	doctorPatientRoutes.GET("/patients", doctorPatientHandler.List)
 
 	return router
 }

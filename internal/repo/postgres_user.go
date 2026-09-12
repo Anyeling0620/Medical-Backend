@@ -22,7 +22,7 @@ func (r *PostgresUserRepository) FindByUsername(ctx context.Context, username st
 	}
 
 	const query = `
-SELECT id, username, password, COALESCE(status, 0), name, dept_id, job
+SELECT id, username, password, COALESCE(status, 0), name, dept_id, job, ref_id
 FROM hospital.mis_user
 WHERE username = $1
 LIMIT 1`
@@ -36,7 +36,7 @@ func (r *PostgresUserRepository) FindByID(ctx context.Context, userID int64) (*u
 	}
 
 	const query = `
-SELECT id, username, password, COALESCE(status, 0), name, dept_id, job
+SELECT id, username, password, COALESCE(status, 0), name, dept_id, job, ref_id
 FROM hospital.mis_user
 WHERE id = $1
 LIMIT 1`
@@ -47,7 +47,7 @@ LIMIT 1`
 func (r *PostgresUserRepository) scanUser(ctx context.Context, query string, arg any) (*user.User, error) {
 	result := &user.User{}
 	var name, job sql.NullString
-	var deptID sql.NullInt64
+	var deptID, refID sql.NullInt64
 	if err := r.db.QueryRowContext(ctx, query, arg).Scan(
 		&result.ID,
 		&result.Username,
@@ -56,6 +56,7 @@ func (r *PostgresUserRepository) scanUser(ctx context.Context, query string, arg
 		&name,
 		&deptID,
 		&job,
+		&refID,
 	); err != nil {
 		return nil, err
 	}
@@ -68,6 +69,11 @@ func (r *PostgresUserRepository) scanUser(ctx context.Context, query string, arg
 	}
 	if job.Valid {
 		result.Job = &job.String
+	}
+	// ref_id 是医生账号与 doctor.id 的绑定关系：只在实际有值时设置，
+	// 避免非医生账号被误判为「已绑定编号 0 的医生」。
+	if refID.Valid {
+		result.RefID = &refID.Int64
 	}
 	return result, nil
 }

@@ -171,6 +171,7 @@ func newPatientCardRealmTestRouter(
 		nil, // paymentRepository
 		nil, // alipayGateway
 		nil, // medicalRecordRepository
+		nil, // doctorPatientRepository
 	)
 
 	claims := &userservice.AccessClaims{

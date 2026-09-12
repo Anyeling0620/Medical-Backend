@@ -96,6 +96,7 @@ func NewApp(cfg config.Config) (*App, error) {
 			Timeout:    cfg.Alipay.Timeout,
 		}),
 		repo.NewPostgresMedicalRecordRepository(connectedClients.postgres),
+		repo.NewPostgresDoctorPatientRepository(connectedClients.postgres),
 	)
 
 	return &App{cfg: cfg, server: server, clients: connectedClients, dependencies: dependencies}, nil
