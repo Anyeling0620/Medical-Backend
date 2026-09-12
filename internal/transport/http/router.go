@@ -12,6 +12,7 @@ import (
 	"Medical-Web-Backend/internal/repo"
 	"Medical-Web-Backend/internal/transport/http/handler"
 	"Medical-Web-Backend/internal/transport/http/middleware"
+	medicalrecordservice "Medical-Web-Backend/internal/usecase/medical_record"
 	userservice "Medical-Web-Backend/internal/usecase/misuser"
 	patientauthservice "Medical-Web-Backend/internal/usecase/patientauth"
 	patientcardservice "Medical-Web-Backend/internal/usecase/patientcard"
@@ -35,6 +36,7 @@ func NewRouter(
 	registrationRepository port.RegistrationRepository,
 	paymentRepository port.PaymentRepository,
 	alipayGateway port.AlipayGateway,
+	medicalRecordRepository port.MedicalRecordRepository,
 ) *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
@@ -233,6 +235,29 @@ func NewRouter(
 	)
 	paymentRoutes.POST("", requirePaymentSelect, paymentHandler.Read)
 	paymentRoutes.GET("/:outTradeNo", requirePaymentSelect, paymentHandler.Detail)
+
+	// 病历域（/api/v1/medical-records/*）只服务管理端令牌（realm=mis）：
+	// 医生只能书写「自己负责的挂号记录」下的病历——用例按令牌主体查 mis_user.ref_id 得到
+	// 医生编号，越权与不存在统一 404；未绑定医生身份的账号（含 ROOT）一律 403
+	// AUTH_FORBIDDEN，数据范围绝不退化为全量（契约 §1.2、§6.10 与病历一节）。
+	//
+	// 权限码沿用「模块:动作」约定新建 MEDICAL_RECORD:SELECT/INSERT/UPDATE/DELETE，
+	// 这里刻意不把 ROOT 放进放行名单：在数据库维护者把这些权限记录写入 mis_permission
+	// 并授权给医生角色之前，任何账号（含 ROOT）都会在权限中间件被 403 拦下（建库 SQL 见契约 §13.3）。
+	medicalRecordService := medicalrecordservice.NewService(medicalRecordRepository)
+	medicalRecordHandler := handler.NewMedicalRecordHandler(medicalRecordService, idempotencyStore)
+	medicalRecordRoutes := router.Group("/api/v1/medical-records")
+	medicalRecordRoutes.Use(requireMisAccess)
+	medicalRecordRoutes.GET("", middleware.RequirePermissions(
+		userRepository, []string{"MEDICAL_RECORD:SELECT"}), medicalRecordHandler.List)
+	medicalRecordRoutes.GET("/:medicalRecordId", middleware.RequirePermissions(
+		userRepository, []string{"MEDICAL_RECORD:SELECT"}), medicalRecordHandler.Detail)
+	medicalRecordRoutes.POST("", middleware.RequirePermissions(
+		userRepository, []string{"MEDICAL_RECORD:INSERT"}), medicalRecordHandler.Create)
+	medicalRecordRoutes.PATCH("/:medicalRecordId", middleware.RequirePermissions(
+		userRepository, []string{"MEDICAL_RECORD:UPDATE"}), medicalRecordHandler.Update)
+	medicalRecordRoutes.DELETE("/:medicalRecordId", middleware.RequirePermissions(
+		userRepository, []string{"MEDICAL_RECORD:DELETE"}), medicalRecordHandler.Delete)
 
 	return router
 }
