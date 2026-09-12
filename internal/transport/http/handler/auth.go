@@ -135,6 +135,7 @@ func authResponse(
 			Name:         result.User.Name,
 			DepartmentID: result.User.DepartmentID,
 			Job:          result.User.Job,
+			DoctorID:     result.User.RefID,
 		},
 		Permissions:     result.Permissions,
 		AccessExpiresAt: result.Tokens.AccessExpiresAt.UTC().Format(time.RFC3339),

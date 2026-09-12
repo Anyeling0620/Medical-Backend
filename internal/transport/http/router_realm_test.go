@@ -62,6 +62,7 @@ func newRealmTestRouter(t *testing.T, realm domainauth.Realm) (*gin.Engine, stri
 		nil, // registrationRepository
 		nil, // paymentRepository
 		nil, // alipayGateway
+		nil, // doctorPatientRepository
 	)
 
 	claims := &userservice.AccessClaims{
