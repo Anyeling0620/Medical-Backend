@@ -1,36 +1,27 @@
-# 后端容器编排。
-#
-# 本文件只负责「发布与回滚」，不负责构建：镜像由 CI（Jenkins）用构建号打好标签再启动，
-# 这样每次上线都有可回退的镜像标签。本文件不含 build 段，镜像缺失时 compose 只会尝试拉取并失败，不会现场构建。
-# 构建与启动的完整命令：
-#   docker build -t medical-backend:$BUILD_NUMBER -f deploy/Dockerfile .
-#   TAG=$BUILD_NUMBER docker compose -f deploy/docker-compose.yaml up -d
 services:
   medical-backend:
-    # 镜像标签由 CI 通过 TAG 注入；未传 TAG 时回退到 latest。
-    # 回滚就是把 TAG 换成上一个构建号重新 up -d。
     image: medical-backend:${TAG:-latest}
     container_name: medical-backend
-    # 容器退出、Docker 重启、宿主机重启都自动拉起
     restart: always
-    # 配置与密钥只放在宿主机上，既不进仓库也不进镜像。
-    # 默认路径是生产用的 /opt/medical/backend.env；本地或异机调试可以覆盖：
-    #   BACKEND_ENV_FILE=../.env docker compose -f deploy/docker-compose.yaml up -d
-    # 字段模板见仓库根目录 .env.example，注意其中关于生产取值的说明。
+
     env_file:
       - ${BACKEND_ENV_FILE:-/opt/medical/backend.env}
-    # 只绑定宿主回环地址：API 仅对同机 nginx 可见，避免外部绕过域名与 HTTPS 直连后端端口。
-    # 前提是 nginx 跑在宿主机上；若日后把 nginx 也搬进容器，需要改成容器网络互访。
+
+    # 保留宿主机本地健康检查，但不向公网开放
     ports:
       - "127.0.0.1:9080:9080"
-    # distroless 镜像内没有 shell 与 curl，无法配置 healthcheck，容器存活由 CI 判断：
-    #   docker inspect -f '{{.State.Running}}' medical-backend
-    # 注意 GET /health 只要进程还活着就返回 200，依赖不可用时只是 body 里的 status 变成 degraded；
-    # 因此 HTTP 层校验要在宿主机上执行，而且要看返回体里的 status 是不是 ok，只看退出码等于没验：
-    #   curl -sS http://127.0.0.1:9080/health
-    # 另外上面 env_file 指向的文件不存在时 up -d 会直接失败，CI 里应先断言它存在。
+
+    # 加入 Nginx 已有的默认网络
+    networks:
+      - nginx-network
+
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+networks:
+  nginx-network:
+    external: true
+    name: nginx_default
