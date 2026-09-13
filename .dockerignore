@@ -1,0 +1,14 @@
+# 构建上下文过滤：避免把本地配置、密钥和仓库元数据送进 Docker daemon。
+#
+# 注意：不要删除本文件——.env 内含数据库密码、微信与支付宝私钥、TRTC 密钥。
+# 最终镜像只 COPY 编译产物，这些文件不会进镜像；本文件的作用是缩小上下文并避免密钥落到构建缓存里。
+.git
+.gitignore
+.idea
+.env
+.env.*
+**/.env
+!.env.example
+deploy/.gitkeep
+docx
+READMD.md

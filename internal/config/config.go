@@ -28,7 +28,10 @@ type AppConfig struct {
 
 type HTTPConfig struct {
 	Host string `env:"HTTP_HOST" envDefault:"0.0.0.0"`
-	Port int    `env:"HTTP_PORT" envDefault:"8080"`
+	// 默认端口必须与 .env/.env.example 的 HTTP_PORT、deploy/Dockerfile 的 EXPOSE、
+	// deploy/docker-compose.yaml 的端口映射保持一致（当前统一为 9080）：
+	// 否则漏配 HTTP_PORT 时容器会监听 8080，而宿主机映射的是 9080，容器起了却连不通。
+	Port int `env:"HTTP_PORT" envDefault:"9080"`
 }
 
 type RedisConfig struct {
