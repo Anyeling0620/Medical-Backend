@@ -55,6 +55,7 @@ func newRealmTestRouter(t *testing.T, realm domainauth.Realm) (*gin.Engine, stri
 		realmRouterUserRepo{},
 		contractTokenRepo{},
 		nil, // doctorRepository
+		nil, // publicCatalogRepository
 		nil, // scheduleRepository
 		nil, // publicScheduleRepository
 		nil, // scheduleCacheVersioner

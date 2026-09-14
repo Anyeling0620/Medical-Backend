@@ -72,6 +72,16 @@ type paymentHandlerTestRepo struct {
 	saveCalls   []paymentHandlerTestSaveCall
 }
 
+// ListExpiredUnpaid 是端口补齐：本文件只覆盖 HTTP 层，不模拟收口任务的扫描。
+func (r *paymentHandlerTestRepo) ListExpiredUnpaid(_ context.Context, _ int, _ time.Time, _ int64) ([]domainpayment.Payment, error) {
+	return nil, nil
+}
+
+// ExpireUnpaid 是端口补齐：本文件只覆盖 HTTP 层，不模拟收口事务。
+func (r *paymentHandlerTestRepo) ExpireUnpaid(_ context.Context, _ string) (bool, error) {
+	return false, nil
+}
+
 // paymentHandlerTestSaveCall 记录二维码回写入参。
 type paymentHandlerTestSaveCall struct {
 	outTradeNo string
@@ -180,6 +190,11 @@ func (g *paymentHandlerTestGateway) Precreate(_ context.Context, req domainpayme
 
 func (g *paymentHandlerTestGateway) QueryTrade(_ context.Context, _ string) (*domainpayment.TradeQueryResult, error) {
 	return &domainpayment.TradeQueryResult{}, nil
+}
+
+// CancelTrade 是端口补齐：本文件不覆盖关单，按「支付宝不可用」返回，由调用方按关单失败处理。
+func (g *paymentHandlerTestGateway) CancelTrade(_ context.Context, _ string) error {
+	return port.ErrAlipayUnavailable
 }
 
 func (g *paymentHandlerTestGateway) VerifyNotify(_ context.Context, form url.Values) (*domainpayment.NotifyPayload, error) {

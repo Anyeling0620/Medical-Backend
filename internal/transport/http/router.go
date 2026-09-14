@@ -30,6 +30,9 @@ func NewRouter(
 	userRepository port.UserRepository,
 	tokenRepository port.TokenRepository,
 	doctorRepository *repo.PostgresDoctorRepository,
+	// publicCatalogRepository 是公开域目录的只读仓储：生产环境传入带逻辑过期缓存的装饰器，
+	// 管理端 catalog 路由继续使用 doctorRepository，保证管理端始终读最新数据。
+	publicCatalogRepository port.PublicCatalogRepository,
 	scheduleRepository *repo.PostgresScheduleRepository,
 	publicScheduleRepository port.PublicScheduleRepository,
 	scheduleCacheVersioner port.ScheduleCacheVersioner,
@@ -48,7 +51,7 @@ func NewRouter(
 	if err := router.SetTrustedProxies(nil); err != nil {
 		log.Printf("setup trusted proxies error: %v", err)
 	}
-	router.GET("/health", func(c *gin.Context) {
+	router.GET("/api/v1/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, health())
 	})
 	router.GET("/", func(c *gin.Context) {
@@ -122,7 +125,7 @@ func NewRouter(
 	if publicScheduleRepository == nil {
 		publicScheduleRepository = scheduleRepository
 	}
-	publicService := publiccatalogservice.NewService(doctorRepository, publicScheduleRepository, nil)
+	publicService := publiccatalogservice.NewService(publicCatalogRepository, publicScheduleRepository, nil)
 	publicHandler := handler.NewPublicCatalogHandler(publicService, utils.MinioPublicURL(cfg))
 	publicRoutes := router.Group("/api/v1/public")
 	publicRoutes.GET("/departments", publicHandler.ListDepartments)

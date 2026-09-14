@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	localhostCORSHost    = "localhost"
+	localhostCORSHost    = "0.0.0.0"
 	localhostCORSMinPort = 0
 	localhostCORSMaxPort = 65535
 )

@@ -1,9 +1,27 @@
 services:
   medical-backend:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
+    image: medical-backend:${TAG:-latest}
+    container_name: medical-backend
+    restart: always
+
     env_file:
-      - ../.env
+      - ${BACKEND_ENV_FILE:-/opt/medical/backend.env}
+
+    # 保留宿主机本地健康检查，但不向公网开放
     ports:
-      - "8080:8080"
+      - "127.0.0.1:9080:9080"
+
+    # 加入 Nginx 已有的默认网络
+    networks:
+      - nginx-network
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  nginx-network:
+    external: true
+    name: nginx_default

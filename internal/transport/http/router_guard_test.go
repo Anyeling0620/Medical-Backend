@@ -14,7 +14,7 @@ import (
 // 白名单之外的路由一律必须拒绝匿名请求；后续新增公开路由时必须同步登记到这里。
 var anonymousAllowedRoutePaths = map[string]bool{
 	"/":                        true,
-	"/health":                  true,
+	"/api/v1/health":           true,
 	"/api/v1/mis/auth/login":   true,
 	"/api/v1/mis/auth/refresh": true,
 	"/api/v1/mis/auth/logout":  true,

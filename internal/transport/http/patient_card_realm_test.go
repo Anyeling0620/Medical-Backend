@@ -163,6 +163,7 @@ func newPatientCardRealmTestRouter(
 		realmRouterUserRepo{},
 		contractTokenRepo{},
 		nil, // doctorRepository
+		nil, // publicCatalogRepository
 		nil, // scheduleRepository
 		nil, // publicScheduleRepository
 		nil, // scheduleCacheVersioner

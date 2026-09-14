@@ -22,6 +22,9 @@ type Config struct {
 	WeChat   WeChatConfig
 	Alipay   AlipayConfig
 	Cache    CacheConfig
+	Worker   WorkerConfig
+	// PublicCatalogCache 是匿名公开域目录（科室 / 子科室 / 医生）的逻辑过期缓存配置。
+	PublicCatalogCache PublicCatalogCacheConfig
 }
 
 // 公开域读缓存（T4）的缺省值与安全边界。
@@ -47,6 +50,10 @@ const (
 //
 // 定位：缓存是**性能依赖，不是正确性依赖**。Redis 不可用时读路径必须 fail open 直查数据库，
 // 与幂等存储不可用时返回 503（fail closed）的取舍方向相反，实现时不要照抄幂等那套。
+//
+// 与 T4a（目录缓存，PublicCatalogCacheConfig）的关系：两者当前各自保留独立的环境变量前缀
+// （CACHE_* 与 PUBLIC_CATALOG_CACHE_*），因为统一前缀会改动已部署环境的变量名；
+// 合并两条缓存分支时按原样保留，统一前缀属于后续改造。
 type CacheConfig struct {
 	// Enabled 是读缓存总开关；关闭后公开域查询一律直查数据库。
 	Enabled bool `env:"CACHE_ENABLED" envDefault:"true"`
@@ -88,13 +95,39 @@ func (c CacheConfig) Normalize() CacheConfig {
 	return c
 }
 
+// WorkerConfig 是进程内后台任务（当前只有订单过期收口任务）的开关与节奏。
+//
+// 收口任务的规则见 04-api-contract.md §6.8 与 创建订单与支付业务说明.md 第 7 节：
+// 每 10~30 秒一轮、进程启动先扫一轮、查询失败重试后仍继续收口。关闭任务会让未付款订单
+// 一直占用号源，因此只在明确知道后果时才应关闭（bootstrap 启动时会输出告警）。
+type WorkerConfig struct {
+	// OrderExpiryEnabled 是订单过期收口任务的开关。
+	OrderExpiryEnabled bool `env:"ORDER_EXPIRY_WORKER_ENABLED" envDefault:"true"`
+	// OrderExpiryInterval 是扫描间隔，缺省 20 秒（规格建议 10~30 秒）。
+	OrderExpiryInterval time.Duration `env:"ORDER_EXPIRY_INTERVAL" envDefault:"20s"`
+	// OrderExpiryBatchSize 是单轮扫描的订单上限。
+	OrderExpiryBatchSize int `env:"ORDER_EXPIRY_BATCH_SIZE" envDefault:"100"`
+	// OrderExpiryQueryAttempts 是单笔订单调用 alipay.trade.query 的最大尝试次数（含首次）；
+	// 超过阈值仍失败时继续收口，保证号源释放不被支付宝可用性阻塞。
+	OrderExpiryQueryAttempts int `env:"ORDER_EXPIRY_QUERY_ATTEMPTS" envDefault:"3"`
+	// OrderExpiryQueryRetryInterval 是两次查询尝试之间的等待间隔。
+	OrderExpiryQueryRetryInterval time.Duration `env:"ORDER_EXPIRY_QUERY_RETRY_INTERVAL" envDefault:"500ms"`
+	// OrderExpiryOrderTimeout 是单笔订单外部调用（查询 + 关单）的总时限。
+	// 必须大于「ORDER_EXPIRY_QUERY_ATTEMPTS × ALIPAY_HTTP_TIMEOUT + 重试等待」并留出一次关单的余量，
+	// 否则重试与关单会被单笔时限掐掉（缺省组合为 3×5s 查询 + 一次 5s 关单，故取 30s）。
+	OrderExpiryOrderTimeout time.Duration `env:"ORDER_EXPIRY_ORDER_TIMEOUT" envDefault:"30s"`
+}
+
 type AppConfig struct {
 	Env string `env:"APP_ENV" envDefault:"development"`
 }
 
 type HTTPConfig struct {
 	Host string `env:"HTTP_HOST" envDefault:"0.0.0.0"`
-	Port int    `env:"HTTP_PORT" envDefault:"8080"`
+	// 默认端口必须与 .env/.env.example 的 HTTP_PORT、deploy/Dockerfile 的 EXPOSE、
+	// deploy/docker-compose.yaml 的端口映射保持一致（当前统一为 9080）：
+	// 否则漏配 HTTP_PORT 时容器会监听 8080，而宿主机映射的是 9080，容器起了却连不通。
+	Port int `env:"HTTP_PORT" envDefault:"9080"`
 }
 
 type RedisConfig struct {
@@ -102,6 +135,18 @@ type RedisConfig struct {
 	Username string `env:"REDIS_USERNAME"`
 	Password string `env:"REDIS_PASSWORD"`
 	DB       int    `env:"REDIS_DB" envDefault:"0"`
+}
+
+// PublicCatalogCacheConfig 是公开域目录缓存（/api/v1/public/* 的科室、子科室、医生）的配置。
+// 该缓存是纯性能优化：总开关关闭、Redis 不可用或载荷损坏时都会退化为直查数据库，
+// 因此不需要像幂等存储那样在依赖不可用时阻断请求。
+type PublicCatalogCacheConfig struct {
+	// Enabled 是缓存总开关：置 false 即完全回到无缓存行为（回滚手段）。
+	Enabled bool `env:"PUBLIC_CATALOG_CACHE_ENABLED" envDefault:"true"`
+	// TTL 是基础逻辑过期时长；物理 TTL 取其 2 倍，以支持「先返回旧值、异步重建」。
+	TTL time.Duration `env:"PUBLIC_CATALOG_CACHE_TTL" envDefault:"30m"`
+	// Jitter 是 TTL 抖动比例，0.2 表示 ±20%，避免同一批键同时逻辑过期引发回源尖峰。
+	Jitter float64 `env:"PUBLIC_CATALOG_CACHE_JITTER" envDefault:"0.2"`
 }
 
 type PostgresConfig struct {

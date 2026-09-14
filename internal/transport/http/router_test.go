@@ -52,6 +52,7 @@ func newContractTestRouter(t *testing.T) *gin.Engine {
 		nil, // userRepository
 		nil, // tokenRepository
 		nil, // doctorRepository
+		nil, // publicCatalogRepository
 		nil, // scheduleRepository
 		nil, // publicScheduleRepository（未注入时路由回退为直查仓储）
 		nil, // scheduleCacheVersioner
@@ -77,6 +78,7 @@ func newContractTestRouterWithAccessToken(t *testing.T) (*gin.Engine, string) {
 		nil, // userRepository
 		contractTokenRepo{},
 		nil, // doctorRepository
+		nil, // publicCatalogRepository
 		nil, // scheduleRepository
 		nil, // publicScheduleRepository
 		nil, // scheduleCacheVersioner
@@ -383,6 +385,16 @@ func (r *paymentOrdersTestRepo) MarkPaid(_ context.Context, _ string, _ string) 
 	return true, nil
 }
 
+// ListExpiredUnpaid 是端口补齐：路由契约用例不覆盖收口任务的扫描。
+func (r *paymentOrdersTestRepo) ListExpiredUnpaid(_ context.Context, _ int, _ time.Time, _ int64) ([]domainpayment.Payment, error) {
+	return nil, nil
+}
+
+// ExpireUnpaid 是端口补齐：路由契约用例不覆盖收口事务。
+func (r *paymentOrdersTestRepo) ExpireUnpaid(_ context.Context, _ string) (bool, error) {
+	return false, nil
+}
+
 // itemOrNotFound 返回订单副本；未注入订单时按不存在处理，避免用例误判。
 func (r *paymentOrdersTestRepo) itemOrNotFound() (*domainpayment.Payment, error) {
 	if r.item == nil {
@@ -407,6 +419,11 @@ func (g *paymentOrdersTestGateway) Precreate(
 
 func (g *paymentOrdersTestGateway) QueryTrade(_ context.Context, _ string) (*domainpayment.TradeQueryResult, error) {
 	return &domainpayment.TradeQueryResult{}, nil
+}
+
+// CancelTrade 是端口补齐：路由契约用例不覆盖关单，按「支付宝不可用」返回。
+func (g *paymentOrdersTestGateway) CancelTrade(_ context.Context, _ string) error {
+	return port.ErrAlipayUnavailable
 }
 
 func (g *paymentOrdersTestGateway) VerifyNotify(_ context.Context, _ url.Values) (*domainpayment.NotifyPayload, error) {
@@ -455,6 +472,7 @@ func newPaymentOrdersTestRouter(
 		paymentOrdersTestUserRepo{},
 		contractTokenRepo{},
 		nil, // doctorRepository
+		nil, // publicCatalogRepository
 		nil, // scheduleRepository
 		nil, // publicScheduleRepository
 		nil, // scheduleCacheVersioner

@@ -124,6 +124,12 @@ func NewAlipayGateway(opts AlipayOptions) *AlipayGateway {
 	return gateway
 }
 
+// Ready 报告网关是否具备发起主动查询/关单所需的最小有效配置。
+// 后台收口任务在启动前调用它，避免无效私钥被误判为运行期网络抖动并释放号源。
+func (g *AlipayGateway) Ready() error {
+	return g.readyToCall()
+}
+
 // Precreate 调用 alipay.trade.precreate 生成付款二维码（契约 §6.2 第 5 步）。
 func (g *AlipayGateway) Precreate(
 	ctx context.Context,
@@ -205,6 +211,37 @@ func (g *AlipayGateway) QueryTrade(
 		TotalAmount: result.TotalAmount,
 		GmtPayment:  result.GmtPayment,
 	}, nil
+}
+
+// CancelTrade 调用 alipay.trade.cancel 关闭支付宝侧交易（契约 §6.8 的关单步骤）。
+//
+// 调用口径与 precreate/query 完全一致：公共参数 + biz_content + RSA2 签名，复用 call 与
+// 响应验签，不引入第三套实现。关单失败不阻塞收口，因此这里刻意不做重试，只分类返回错误：
+// ACQ.TRADE_HAS_CLOSE / ACQ.TRADE_HAS_SUCCESS 由 alipayBizError 归为 ErrAlipayTradeClosed，
+// 其余业务码、网络失败与系统级错误归为 ErrAlipayUnavailable（创建订单与支付业务说明.md 第 7 节）。
+func (g *AlipayGateway) CancelTrade(ctx context.Context, outTradeNo string) error {
+	if err := g.readyToCall(); err != nil {
+		return err
+	}
+	payload, err := g.call(ctx, "alipay.trade.cancel", map[string]string{
+		"out_trade_no": outTradeNo,
+	}, "")
+	if err != nil {
+		return err
+	}
+	var result struct {
+		Code    string `json:"code"`
+		Msg     string `json:"msg"`
+		SubCode string `json:"sub_code"`
+		SubMsg  string `json:"sub_msg"`
+	}
+	if err := json.Unmarshal(payload, &result); err != nil {
+		return fmt.Errorf("%w: 解析关单响应失败: %v", port.ErrAlipayUnavailable, err)
+	}
+	if result.Code != alipaySuccessCode {
+		return alipayBizError("alipay.trade.cancel", result.Code, result.SubCode, result.Msg, result.SubMsg)
+	}
+	return nil
 }
 
 // VerifyNotify 校验异步通知的签名与身份（契约 §6.7 第 1、2 步）。

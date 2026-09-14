@@ -873,6 +873,16 @@ func (r *e2eMemoryPaymentRepository) MarkPaid(
 	return true, nil
 }
 
+// ListExpiredUnpaid 是端口补齐：本文件的 E2E 用例不运行收口任务，返回空列表。
+func (r *e2eMemoryPaymentRepository) ListExpiredUnpaid(_ context.Context, _ int, _ time.Time, _ int64) ([]domainpayment.Payment, error) {
+	return nil, nil
+}
+
+// ExpireUnpaid 是端口补齐：本文件的 E2E 用例不运行收口任务，按「未收口」返回。
+func (r *e2eMemoryPaymentRepository) ExpireUnpaid(_ context.Context, _ string) (bool, error) {
+	return false, nil
+}
+
 // ================= 目标 D：判定凭据所属的支付宝环境（只读探测） =================
 
 // e2eProbeGateway 是目标 D 的一个候选网关。
