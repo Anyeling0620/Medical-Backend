@@ -136,6 +136,7 @@ func newMedicalRecordPermissionRouter(
 		medicalRecordPermissionUserRepo{permissions: permissions},
 		contractTokenRepo{},
 		nil, // doctorRepository
+		nil, // publicCatalogRepository
 		nil, // scheduleRepository
 		nil, // idempotencyStore
 		nil, // patientRepository

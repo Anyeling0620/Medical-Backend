@@ -52,6 +52,7 @@ func newContractTestRouter(t *testing.T) *gin.Engine {
 		nil, // userRepository
 		nil, // tokenRepository
 		nil, // doctorRepository
+		nil, // publicCatalogRepository
 		nil, // scheduleRepository
 		nil, // idempotencyStore
 		nil, // patientRepository
@@ -75,6 +76,7 @@ func newContractTestRouterWithAccessToken(t *testing.T) (*gin.Engine, string) {
 		nil, // userRepository
 		contractTokenRepo{},
 		nil, // doctorRepository
+		nil, // publicCatalogRepository
 		nil, // scheduleRepository
 		nil, // idempotencyStore
 		nil, // patientRepository
@@ -466,6 +468,7 @@ func newPaymentOrdersTestRouter(
 		paymentOrdersTestUserRepo{},
 		contractTokenRepo{},
 		nil, // doctorRepository
+		nil, // publicCatalogRepository
 		nil, // scheduleRepository
 		nil, // idempotencyStore
 		nil, // patientRepository

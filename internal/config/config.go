@@ -21,6 +21,8 @@ type Config struct {
 	WeChat   WeChatConfig
 	Alipay   AlipayConfig
 	Worker   WorkerConfig
+	// PublicCatalogCache 是匿名公开域目录（科室 / 子科室 / 医生）的逻辑过期缓存配置。
+	PublicCatalogCache PublicCatalogCacheConfig
 }
 
 // WorkerConfig 是进程内后台任务（当前只有订单过期收口任务）的开关与节奏。
@@ -63,6 +65,18 @@ type RedisConfig struct {
 	Username string `env:"REDIS_USERNAME"`
 	Password string `env:"REDIS_PASSWORD"`
 	DB       int    `env:"REDIS_DB" envDefault:"0"`
+}
+
+// PublicCatalogCacheConfig 是公开域目录缓存（/api/v1/public/* 的科室、子科室、医生）的配置。
+// 该缓存是纯性能优化：总开关关闭、Redis 不可用或载荷损坏时都会退化为直查数据库，
+// 因此不需要像幂等存储那样在依赖不可用时阻断请求。
+type PublicCatalogCacheConfig struct {
+	// Enabled 是缓存总开关：置 false 即完全回到无缓存行为（回滚手段）。
+	Enabled bool `env:"PUBLIC_CATALOG_CACHE_ENABLED" envDefault:"true"`
+	// TTL 是基础逻辑过期时长；物理 TTL 取其 2 倍，以支持「先返回旧值、异步重建」。
+	TTL time.Duration `env:"PUBLIC_CATALOG_CACHE_TTL" envDefault:"30m"`
+	// Jitter 是 TTL 抖动比例，0.2 表示 ±20%，避免同一批键同时逻辑过期引发回源尖峰。
+	Jitter float64 `env:"PUBLIC_CATALOG_CACHE_JITTER" envDefault:"0.2"`
 }
 
 type PostgresConfig struct {

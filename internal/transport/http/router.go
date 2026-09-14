@@ -30,6 +30,9 @@ func NewRouter(
 	userRepository port.UserRepository,
 	tokenRepository port.TokenRepository,
 	doctorRepository *repo.PostgresDoctorRepository,
+	// publicCatalogRepository 是公开域目录的只读仓储：生产环境传入带逻辑过期缓存的装饰器，
+	// 管理端 catalog 路由继续使用 doctorRepository，保证管理端始终读最新数据。
+	publicCatalogRepository port.PublicCatalogRepository,
 	scheduleRepository *repo.PostgresScheduleRepository,
 	idempotencyStore port.IdempotencyStore,
 	patientRepository port.PatientRepository,
@@ -115,7 +118,7 @@ func NewRouter(
 	// 公开查询域（/api/v1/public/*）：匿名只读，不读取也不要求令牌，
 	// 因此不挂 RequireAccessToken / RequirePermissions：携带无效或跨域令牌也必须正常返回
 	// （测试策略「匿名公开域」）。数据可见性与字段裁剪由 publiccatalog 用例与公开域 repository 保证。
-	publicService := publiccatalogservice.NewService(doctorRepository, scheduleRepository, nil)
+	publicService := publiccatalogservice.NewService(publicCatalogRepository, scheduleRepository, nil)
 	publicHandler := handler.NewPublicCatalogHandler(publicService, utils.MinioPublicURL(cfg))
 	publicRoutes := router.Group("/api/v1/public")
 	publicRoutes.GET("/departments", publicHandler.ListDepartments)
