@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"Medical-Web-Backend/internal/config"
+	"Medical-Web-Backend/internal/port"
 	httptransport "Medical-Web-Backend/internal/transport/http"
 	"github.com/gin-gonic/gin"
 )
@@ -68,6 +69,26 @@ func NewApp(cfg config.Config) (*App, error) {
 			log.Printf("dependency %s unavailable: %s", name, dependency.Error)
 		}
 	}
+	// 公开域目录缓存：只包住公开读路径（/api/v1/public/* 的科室、子科室、医生），
+	// 管理端 catalog 域继续用原始仓储读最新数据。Redis 未连接时不安装装饰器，
+	// 避免把「持有 nil 指针的接口值」传进缓存层。
+	catalogSource := repo.NewPostgresDoctorRepository(connectedClients.postgres)
+	var publicCatalogRepository port.PublicCatalogRepository = catalogSource
+	if cfg.PublicCatalogCache.Enabled && connectedClients.redis != nil {
+		cachedCatalog, cacheErr := repo.NewCachedPublicCatalogRepository(
+			catalogSource,
+			connectedClients.redis,
+			repo.PublicCatalogCacheOptions{
+				Enabled:     cfg.PublicCatalogCache.Enabled,
+				TTL:         cfg.PublicCatalogCache.TTL,
+				JitterRatio: cfg.PublicCatalogCache.Jitter,
+			},
+		)
+		if cacheErr != nil {
+			return nil, cacheErr
+		}
+		publicCatalogRepository = cachedCatalog
+	}
 	server := httptransport.NewRouter(func() map[string]any {
 		status := "ok"
 		for _, dependency := range dependencies {
@@ -80,7 +101,8 @@ func NewApp(cfg config.Config) (*App, error) {
 	}, cfg,
 		repo.NewPostgresUserRepository(connectedClients.postgres),
 		repo.NewRedisTokenRepository(connectedClients.redis),
-		repo.NewPostgresDoctorRepository(connectedClients.postgres),
+		catalogSource,
+		publicCatalogRepository,
 		repo.NewPostgresScheduleRepository(connectedClients.postgres),
 		repo.NewRedisIdempotencyStore(connectedClients.redis),
 		repo.NewPostgresPatientRepository(connectedClients.postgres),

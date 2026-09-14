@@ -89,6 +89,7 @@ func newDoctorPatientsTestRouter(
 		users,
 		contractTokenRepo{},
 		nil, // doctorRepository
+		nil, // publicCatalogRepository
 		nil, // scheduleRepository
 		nil, // idempotencyStore
 		nil, // patientRepository
