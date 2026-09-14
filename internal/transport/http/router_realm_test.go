@@ -56,6 +56,8 @@ func newRealmTestRouter(t *testing.T, realm domainauth.Realm) (*gin.Engine, stri
 		contractTokenRepo{},
 		nil, // doctorRepository
 		nil, // scheduleRepository
+		nil, // publicScheduleRepository
+		nil, // scheduleCacheVersioner
 		nil, // idempotencyStore
 		nil, // patientRepository
 		nil, // wechatAuthenticator

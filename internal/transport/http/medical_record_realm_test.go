@@ -137,6 +137,8 @@ func newMedicalRecordPermissionRouter(
 		contractTokenRepo{},
 		nil, // doctorRepository
 		nil, // scheduleRepository
+		nil, // publicScheduleRepository
+		nil, // scheduleCacheVersioner
 		nil, // idempotencyStore
 		nil, // patientRepository
 		nil, // wechatAuthenticator

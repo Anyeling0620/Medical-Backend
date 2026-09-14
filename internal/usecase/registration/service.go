@@ -143,10 +143,22 @@ type Service struct {
 	cards      port.PatientCardRepository
 	patients   port.PatientUserRepository
 	precreator port.PaymentPrecreator
+	// versioner 是公开排班读缓存的失效端口（T4b）：建单扣减号源后必须立即失效，
+	// 否则「挂号成功后余量立即可见」会被 5~10 秒的缓存 TTL 挡住。为 nil 表示未启用缓存。
+	versioner port.ScheduleCacheVersioner
 	// now 可注入，用于确定性地验证时段是否已开始与占用判定。
 	now func() time.Time
 	// newTradeNo 生成外部交易号，可注入以便测试固化格式。
 	newTradeNo func(time.Time) string
+}
+
+// Option 是构造挂号用例的可选配置项（保持既有调用方不必改动签名）。
+type Option func(*Service)
+
+// WithScheduleCacheVersioner 注入公开排班读缓存的版本号递增器（T4b）；
+// 传入 nil 等价于不启用缓存。
+func WithScheduleCacheVersioner(versioner port.ScheduleCacheVersioner) Option {
+	return func(s *Service) { s.versioner = versioner }
 }
 
 // NewService 构造挂号用例；now 为空时回退到当前 UTC 时间。
@@ -159,17 +171,39 @@ func NewService(
 	patients port.PatientUserRepository,
 	precreator port.PaymentPrecreator,
 	now func() time.Time,
+	options ...Option,
 ) *Service {
 	if now == nil {
 		now = func() time.Time { return time.Now().UTC() }
 	}
-	return &Service{
+	service := &Service{
 		repo:       repo,
 		cards:      cards,
 		patients:   patients,
 		precreator: precreator,
 		now:        now,
 		newTradeNo: domainregistration.NewOutTradeNo,
+	}
+	for _, option := range options {
+		if option != nil {
+			option(service)
+		}
+	}
+	return service
+}
+
+// invalidatePublicSchedules 使公开排班缓存立即失效。
+//
+// 失败只记日志、不让业务失败：建单已提交，缓存是**性能依赖而不是正确性依赖**。
+// 漏失效的代价是前端短暂显示可挂、下单时拿到 409 REGISTRATION_SLOT_SOLD_OUT，
+// 陈旧窗口不超过缓存 TTL（设计文档已写明这一可接受风险）。
+func (s *Service) invalidatePublicSchedules(ctx context.Context, subdepartmentID, doctorID int64) {
+	if s == nil || s.versioner == nil {
+		return
+	}
+	if err := s.versioner.BumpSchedules(ctx, subdepartmentID, doctorID); err != nil {
+		log.Printf("告警：挂号建单后公开排班缓存失效失败 subdepartment_id=%d doctor_id=%d: %v",
+			subdepartmentID, doctorID, err)
 	}
 }
 
@@ -316,6 +350,9 @@ func (s *Service) Create(
 	if err != nil {
 		return nil, s.createError(err, input.ScheduleID)
 	}
+	// 建单事务已提交（两级号源都已扣减）：立即递增版本号让公开排班缓存失效，
+	// 「挂号成功后余量立即可见」不依赖 TTL 到期（T4b）。
+	s.invalidatePublicSchedules(ctx, created.SubdepartmentID, created.DoctorID)
 	// 建单事务已提交，随后在同一 HTTP 请求内完成预下单（业务说明第 3.1 节第 5~6 步）。
 	pay, err := s.precreateForOrder(ctx, created)
 	if err != nil {
@@ -355,6 +392,9 @@ func (s *Service) precreateForOrder(
 		log.Printf("告警：建单整单补偿失败，可能残留占用号源的订单 registration_id=%d out_trade_no=%s: %v",
 			created.ID, created.OutTradeNo, compErr)
 	}
+	// 补偿把刚扣掉的号源退回：再失效一次，避免「扣减后立刻回填」的缓存把余量少算一个，
+	// 一直压到 TTL 到期（该偏差只会让前端少显示号源，不会造成超卖）。
+	s.invalidatePublicSchedules(compCtx, created.SubdepartmentID, created.DoctorID)
 	return nil, paymentUnavailableError()
 }
 

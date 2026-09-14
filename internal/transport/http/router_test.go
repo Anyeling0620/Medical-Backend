@@ -53,6 +53,8 @@ func newContractTestRouter(t *testing.T) *gin.Engine {
 		nil, // tokenRepository
 		nil, // doctorRepository
 		nil, // scheduleRepository
+		nil, // publicScheduleRepository（未注入时路由回退为直查仓储）
+		nil, // scheduleCacheVersioner
 		nil, // idempotencyStore
 		nil, // patientRepository
 		nil, // wechatAuthenticator
@@ -76,6 +78,8 @@ func newContractTestRouterWithAccessToken(t *testing.T) (*gin.Engine, string) {
 		contractTokenRepo{},
 		nil, // doctorRepository
 		nil, // scheduleRepository
+		nil, // publicScheduleRepository
+		nil, // scheduleCacheVersioner
 		nil, // idempotencyStore
 		nil, // patientRepository
 		nil, // wechatAuthenticator
@@ -452,6 +456,8 @@ func newPaymentOrdersTestRouter(
 		contractTokenRepo{},
 		nil, // doctorRepository
 		nil, // scheduleRepository
+		nil, // publicScheduleRepository
+		nil, // scheduleCacheVersioner
 		nil, // idempotencyStore
 		nil, // patientRepository
 		nil, // wechatAuthenticator

@@ -31,6 +31,8 @@ func NewRouter(
 	tokenRepository port.TokenRepository,
 	doctorRepository *repo.PostgresDoctorRepository,
 	scheduleRepository *repo.PostgresScheduleRepository,
+	publicScheduleRepository port.PublicScheduleRepository,
+	scheduleCacheVersioner port.ScheduleCacheVersioner,
 	idempotencyStore port.IdempotencyStore,
 	patientRepository port.PatientRepository,
 	wechatAuthenticator port.WeChatAuthenticator,
@@ -115,7 +117,12 @@ func NewRouter(
 	// 公开查询域（/api/v1/public/*）：匿名只读，不读取也不要求令牌，
 	// 因此不挂 RequireAccessToken / RequirePermissions：携带无效或跨域令牌也必须正常返回
 	// （测试策略「匿名公开域」）。数据可见性与字段裁剪由 publiccatalog 用例与公开域 repository 保证。
-	publicService := publiccatalogservice.NewService(doctorRepository, scheduleRepository, nil)
+	// 时段查询走 T4b 的读缓存装饰器；未注入（测试、缓存关闭或 Redis 不可用）时回退到直查仓储，
+	// 保证两条路径的响应形状一致、行为与改动前一致。
+	if publicScheduleRepository == nil {
+		publicScheduleRepository = scheduleRepository
+	}
+	publicService := publiccatalogservice.NewService(doctorRepository, publicScheduleRepository, nil)
 	publicHandler := handler.NewPublicCatalogHandler(publicService, utils.MinioPublicURL(cfg))
 	publicRoutes := router.Group("/api/v1/public")
 	publicRoutes.GET("/departments", publicHandler.ListDepartments)
@@ -126,7 +133,9 @@ func NewRouter(
 	publicRoutes.GET("/schedules", publicHandler.Schedules)
 
 	catalogHandler := handler.NewCatalogHandler(doctorRepository, userRepository, utils.MinioPublicURL(cfg))
-	scheduleService := scheduleservice.NewService(scheduleRepository, nil)
+	// 排班写路径通过端口递增版本号使公开排班缓存失效，usecase 不直接依赖 Redis（T4b）。
+	scheduleService := scheduleservice.NewService(scheduleRepository, nil,
+		scheduleservice.WithScheduleCacheVersioner(scheduleCacheVersioner))
 	scheduleHandler := handler.NewScheduleHandler(scheduleService, idempotencyStore)
 	scheduleSlotHandler := handler.NewScheduleSlotHandler(scheduleService, idempotencyStore)
 	// 受保护接口按认证域分组挂载访问令牌校验，而不是挂在引擎级：
@@ -193,6 +202,7 @@ func NewRouter(
 		patientRepository,
 		paymentService,
 		nil,
+		registrationservice.WithScheduleCacheVersioner(scheduleCacheVersioner),
 	)
 	registrationHandler := handler.NewRegistrationHandler(registrationService, idempotencyStore)
 	requireRegistrationSelect := middleware.RequirePermissionOrPatient(

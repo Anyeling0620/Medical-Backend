@@ -164,6 +164,8 @@ func newPatientCardRealmTestRouter(
 		contractTokenRepo{},
 		nil, // doctorRepository
 		nil, // scheduleRepository
+		nil, // publicScheduleRepository
+		nil, // scheduleCacheVersioner
 		nil, // idempotencyStore
 		repo,
 		nil, // wechatAuthenticator

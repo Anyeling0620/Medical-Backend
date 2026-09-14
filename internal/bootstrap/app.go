@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"Medical-Web-Backend/internal/config"
+	"Medical-Web-Backend/internal/port"
 	httptransport "Medical-Web-Backend/internal/transport/http"
 	"github.com/gin-gonic/gin"
 )
@@ -68,6 +69,30 @@ func NewApp(cfg config.Config) (*App, error) {
 			log.Printf("dependency %s unavailable: %s", name, dependency.Error)
 		}
 	}
+	// 公开排班读缓存装配（T4b）：5~10 秒短 TTL + 抖动，配合写路径的版本号主动失效。
+	// 排班缓存带余量，因此不用逻辑过期，且**必须缓存空结果**（实测「今天起 7 天」窗口经常是 0 条）。
+	//
+	// Redis 未连接或总开关关闭时，publicScheduleRepository / scheduleCacheVersioner 保持 nil：
+	// 读路径回退为直查仓储、写路径的失效调用变成空操作，即缓存不可用一律 fail open 直查数据库
+	// （缓存是性能依赖，不是正确性依赖；与幂等存储不可用时返回 503 的取舍方向相反）。
+	scheduleRepository := repo.NewPostgresScheduleRepository(connectedClients.postgres)
+	var publicScheduleRepository port.PublicScheduleRepository
+	var scheduleCacheVersioner port.ScheduleCacheVersioner
+	if cfg.Cache.Enabled && connectedClients.redis != nil {
+		cacheConfig := cfg.Cache.Normalize()
+		scheduleCache := repo.NewScheduleCache(connectedClients.redis, repo.CacheOptions{
+			TTL:          cacheConfig.ScheduleTTL,
+			JitterRatio:  cacheConfig.ScheduleJitter,
+			RedisTimeout: cacheConfig.RedisTimeout,
+		})
+		publicScheduleRepository = repo.NewCachedPublicScheduleRepository(scheduleRepository, scheduleCache)
+		scheduleCacheVersioner = scheduleCache
+		log.Printf("公开排班缓存已启用：ttl=%s jitter=%.2f redis_timeout=%s",
+			cacheConfig.ScheduleTTL, cacheConfig.ScheduleJitter, cacheConfig.RedisTimeout)
+	} else {
+		log.Printf("提示：公开排班缓存未启用（CACHE_ENABLED=%t redis_connected=%t），公开时段查询直查数据库",
+			cfg.Cache.Enabled, connectedClients.redis != nil)
+	}
 	server := httptransport.NewRouter(func() map[string]any {
 		status := "ok"
 		for _, dependency := range dependencies {
@@ -81,7 +106,9 @@ func NewApp(cfg config.Config) (*App, error) {
 		repo.NewPostgresUserRepository(connectedClients.postgres),
 		repo.NewRedisTokenRepository(connectedClients.redis),
 		repo.NewPostgresDoctorRepository(connectedClients.postgres),
-		repo.NewPostgresScheduleRepository(connectedClients.postgres),
+		scheduleRepository,
+		publicScheduleRepository,
+		scheduleCacheVersioner,
 		repo.NewRedisIdempotencyStore(connectedClients.redis),
 		repo.NewPostgresPatientRepository(connectedClients.postgres),
 		repo.NewWeChatCode2SessionClient(cfg.WeChat.AppID, cfg.WeChat.Secret),

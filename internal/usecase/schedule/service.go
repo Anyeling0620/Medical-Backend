@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log"
 	"time"
 
 	"Medical-Web-Backend/internal/domain/schedule"
@@ -45,14 +46,63 @@ type Result struct {
 type Service struct {
 	repo port.ScheduleRepository
 	now  func() time.Time
+	// versioner 是公开排班读缓存的失效端口（T4b）；为 nil 表示未启用缓存，
+	// 所有失效调用退化为空操作，行为与改动前一致。
+	versioner port.ScheduleCacheVersioner
+}
+
+// Option 是构造排班服务的可选配置项（保持既有调用方不必改动签名）。
+type Option func(*Service)
+
+// WithScheduleCacheVersioner 注入公开排班读缓存的版本号递增器（T4b）。
+// 传入 nil 等价于不启用缓存。
+func WithScheduleCacheVersioner(versioner port.ScheduleCacheVersioner) Option {
+	return func(s *Service) { s.versioner = versioner }
 }
 
 // NewService 构造排班服务；now 为空时回退到当前 UTC 时间。
-func NewService(repo port.ScheduleRepository, now func() time.Time) *Service {
+func NewService(repo port.ScheduleRepository, now func() time.Time, options ...Option) *Service {
 	if now == nil {
 		now = func() time.Time { return time.Now().UTC() }
 	}
-	return &Service{repo: repo, now: now}
+	service := &Service{repo: repo, now: now}
+	for _, option := range options {
+		if option != nil {
+			option(service)
+		}
+	}
+	return service
+}
+
+// invalidatePublicSchedules 在写操作提交后使公开排班缓存立即失效。
+//
+// 失败只记日志、不让业务失败：写操作已经提交，缓存是**性能依赖而不是正确性依赖**，
+// 这里不能照抄幂等存储「不可用就 5xx」的取舍。漏失效的代价是前端可能短暂显示可挂、
+// 下单时拿到 409 REGISTRATION_SLOT_SOLD_OUT（错误码已有），且陈旧窗口不超过缓存 TTL。
+func (s *Service) invalidatePublicSchedules(ctx context.Context, subdepartmentID, doctorID int64) {
+	if s == nil || s.versioner == nil {
+		return
+	}
+	if err := s.versioner.BumpSchedules(ctx, subdepartmentID, doctorID); err != nil {
+		log.Printf("告警：公开排班缓存失效失败 subdepartment_id=%d doctor_id=%d: %v",
+			subdepartmentID, doctorID, err)
+	}
+}
+
+// invalidatePublicSchedulesByPlan 用于只有 planId、拿不到作用域的时段写路径：
+// 读一次计划定位到「子科室 + 医生」两个维度；计划读不到（例如已被并发删除）时
+// 退化为全局失效——宁可多失效一次回源，也不能漏失效留下脏余量。
+func (s *Service) invalidatePublicSchedulesByPlan(ctx context.Context, planID int64) {
+	if s == nil || s.versioner == nil || planID < 1 {
+		return
+	}
+	plan, err := s.repo.FindPlan(ctx, planID)
+	if err != nil {
+		log.Printf("提示：公开排班缓存按计划失效时读取计划失败 plan_id=%d，退化为全局失效: %v", planID, err)
+		s.invalidatePublicSchedules(ctx, 0, 0)
+		return
+	}
+	s.invalidatePublicSchedules(ctx, plan.SubdepartmentID, plan.DoctorID)
 }
 
 // ListPlans 分页列出排班计划；空结果保证返回非 nil 切片以输出 items:[]。
@@ -123,6 +173,9 @@ func (s *Service) CreatePlan(ctx context.Context, p schedule.WorkPlan) (*Result,
 	if err != nil {
 		return nil, mapServiceError(err)
 	}
+	// 计划创建会新增可挂号时段：立即失效该子科室与医生的公开排班缓存，
+	// 避免「空结果缓存」把新排班挡住（T4b）。
+	s.invalidatePublicSchedules(ctx, p.SubdepartmentID, p.DoctorID)
 	// 插入成功：返回生成的 ID 与资源对象，handler 据此输出 201 资源与 Location。
 	return &Result{Plan: &p, NewID: p.ID}, nil
 }
@@ -137,11 +190,15 @@ func (s *Service) UpdatePlan(ctx context.Context, planID int64, maximum int16) (
 		return nil, err
 	}
 	var updated *schedule.WorkPlan
+	// scopeSubdepartment / scopeDoctor 从事务内读到的计划快照里取出：
+	// 失效需要的「子科室 + 医生」两个维度在 planID 上是查不到的。
+	var scopeSubdepartment, scopeDoctor int64
 	err := s.repo.ExecTx(ctx, func(tx port.ScheduleTx) error {
 		plan, err := tx.TxFindPlanLocked(ctx, planID)
 		if err != nil {
 			return err
 		}
+		scopeSubdepartment, scopeDoctor = plan.SubdepartmentID, plan.DoctorID
 		// 已开始/已结束的计划锁定，不允许修改。
 		if !plan.CanModify(s.now()) {
 			return &ServiceError{Code: CodePlanLocked, Message: "排班计划已开始或已结束，不能修改"}
@@ -161,6 +218,8 @@ func (s *Service) UpdatePlan(ctx context.Context, planID int64, maximum int16) (
 	if err != nil {
 		return nil, mapServiceError(err)
 	}
+	// 计划容量变化会改变公开余量：提交后立即失效（T4b）。
+	s.invalidatePublicSchedules(ctx, scopeSubdepartment, scopeDoctor)
 	return &Result{Plan: updated}, nil
 }
 
@@ -169,11 +228,13 @@ func (s *Service) DeletePlan(ctx context.Context, planID int64) error {
 	if s.repo == nil {
 		return errors.New("排班仓库未配置")
 	}
+	var scopeSubdepartment, scopeDoctor int64
 	err := s.repo.ExecTx(ctx, func(tx port.ScheduleTx) error {
 		plan, err := tx.TxFindPlanLocked(ctx, planID)
 		if err != nil {
 			return err
 		}
+		scopeSubdepartment, scopeDoctor = plan.SubdepartmentID, plan.DoctorID
 		// 已开始/已结束不允许删除（表无状态列，不允许软删除）。
 		if !plan.CanModify(s.now()) {
 			return &ServiceError{Code: CodePlanLocked, Message: "排班计划已开始或已结束，不能删除"}
@@ -191,7 +252,12 @@ func (s *Service) DeletePlan(ctx context.Context, planID int64) error {
 		}
 		return tx.TxDeletePlan(ctx, planID)
 	})
-	return mapServiceError(err)
+	if err != nil {
+		return mapServiceError(err)
+	}
+	// 计划删除后其对下的时段不再可挂：提交后立即失效（T4b）。
+	s.invalidatePublicSchedules(ctx, scopeSubdepartment, scopeDoctor)
+	return nil
 }
 
 // maximumServiceError 把 maximum 越界映射为契约要求的两种文案：
@@ -282,7 +348,13 @@ func (s *Service) CreateSlot(ctx context.Context, input schedule.ScheduleSlot) (
 	if s == nil || s.repo == nil {
 		return nil, schedule.ErrInvalidWorkPlan
 	}
-	return s.repo.CreateSlot(ctx, input, s.now())
+	created, err := s.repo.CreateSlot(ctx, input, s.now())
+	if err != nil {
+		return nil, err
+	}
+	// 新增时段会新增可挂号号源：按计划定位作用域后失效（T4b）。
+	s.invalidatePublicSchedulesByPlan(ctx, input.WorkPlanID)
+	return created, nil
 }
 
 // UpdateSlotMaximum 修改时段容量。
@@ -295,7 +367,13 @@ func (s *Service) UpdateSlotMaximum(ctx context.Context, slotID int64, maximum i
 	if s == nil || s.repo == nil {
 		return nil, schedule.ErrInvalidWorkPlan
 	}
-	return s.repo.UpdateSlotMaximum(ctx, slotID, maximum, s.now())
+	updated, err := s.repo.UpdateSlotMaximum(ctx, slotID, maximum, s.now())
+	if err != nil {
+		return nil, err
+	}
+	// 时段容量变化会改变公开余量：按计划定位作用域后失效（T4b）。
+	s.invalidatePublicSchedulesByPlan(ctx, updated.WorkPlanID)
+	return updated, nil
 }
 
 // DeleteSlot 物理删除时段：仅允许无挂号且所属计划未开始的时段。
@@ -306,5 +384,11 @@ func (s *Service) DeleteSlot(ctx context.Context, slotID int64) error {
 	if s == nil || s.repo == nil {
 		return schedule.ErrInvalidWorkPlan
 	}
-	return s.repo.DeleteSlot(ctx, slotID, s.now())
+	if err := s.repo.DeleteSlot(ctx, slotID, s.now()); err != nil {
+		return err
+	}
+	// 删除时段后无法再读到「时段 -> 计划」的映射（记录已消失），拿不到子科室/医生作用域，
+	// 因此退化为全局失效：多一次回源，换「绝不漏失效」。
+	s.invalidatePublicSchedules(ctx, 0, 0)
+	return nil
 }
