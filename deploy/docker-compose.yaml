@@ -5,7 +5,7 @@ services:
     restart: always
 
     env_file:
-      - ${BACKEND_ENV_FILE:-/opt/medical/backend.env}
+      - /opt/medical/backend.env
 
     # 保留宿主机本地健康检查，但不向公网开放
     ports:
