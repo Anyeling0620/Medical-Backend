@@ -155,6 +155,13 @@ type PostgresConfig struct {
 	Password string `env:"PGSQL_PASSWORD"`
 	Database string `env:"PGSQL_DATABASE" envDefault:"postgres"`
 	SSLMode  string `env:"PGSQL_SSLMODE" envDefault:"disable"`
+	// database/sql 的 MaxIdleConns 默认只有 2，而本项目数据库跨公网 RTT 约 27ms；
+	// 并发 32 时反复关闭重建连接曾把 P99 推高到 1.7~3.2s，因此需显式保留足够空闲连接。
+	// MaxOpenConns 默认 0 表示不限，并发高时可能顶爆数据库的 max_connections，因此需显式封顶。
+	MaxOpenConns    int           `env:"PGSQL_MAX_OPEN_CONNS" envDefault:"30"`
+	MaxIdleConns    int           `env:"PGSQL_MAX_IDLE_CONNS" envDefault:"30"`
+	ConnMaxLifetime time.Duration `env:"PGSQL_CONN_MAX_LIFETIME" envDefault:"30m"`
+	ConnMaxIdleTime time.Duration `env:"PGSQL_CONN_MAX_IDLE_TIME" envDefault:"5m"`
 }
 
 type MinIOConfig struct {
