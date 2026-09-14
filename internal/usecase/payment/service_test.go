@@ -114,6 +114,14 @@ type fakePaymentRepository struct {
 	saveFailsBeforeOK int
 	markPaidResult    bool
 	markPaidErr       error
+	// 收口任务（§6.8）：过期订单列表与收口事务结果注入。
+	expiredItems     []domainpayment.Payment
+	listExpiredErr   error
+	listExpiredLimit int
+	listExpiredAfter time.Time
+	listExpiredID    int64
+	expireResult     bool
+	expireErr        error
 
 	// 调用记录。
 	regQueries  []findByRegistrationCall
@@ -121,6 +129,7 @@ type fakePaymentRepository struct {
 	ensureCalls []string
 	saveCalls   []savePrepayIDCall
 	markCalls   []markPaidCall
+	expireCalls []string
 }
 
 // findByRegistrationCall 记录按挂号编号读取的入参。
@@ -226,6 +235,34 @@ func (r *fakePaymentRepository) MarkPaid(_ context.Context, outTradeNo string, t
 	return r.markPaidResult, r.markPaidErr
 }
 
+// ListExpiredUnpaid 返回注入的过期未付款订单（缺省为空，表示本轮没有需要收口的订单）。
+func (r *fakePaymentRepository) ListExpiredUnpaid(_ context.Context, limit int, afterExpireAt time.Time, afterRegistrationID int64) ([]domainpayment.Payment, error) {
+	r.listExpiredLimit = limit
+	r.listExpiredAfter = afterExpireAt
+	r.listExpiredID = afterRegistrationID
+	if r.listExpiredErr != nil {
+		return nil, r.listExpiredErr
+	}
+	items := make([]domainpayment.Payment, 0, limit)
+	for _, item := range r.expiredItems {
+		if !afterExpireAt.IsZero() && !item.ExpireAt.After(afterExpireAt) &&
+			!(item.ExpireAt.Equal(afterExpireAt) && item.RegistrationID > afterRegistrationID) {
+			continue
+		}
+		items = append(items, item)
+		if len(items) == limit {
+			break
+		}
+	}
+	return items, nil
+}
+
+// ExpireUnpaid 模拟收口事务：记录入参并返回注入的结果（缺省 false 表示订单已被其它路径处理）。
+func (r *fakePaymentRepository) ExpireUnpaid(_ context.Context, outTradeNo string) (bool, error) {
+	r.expireCalls = append(r.expireCalls, outTradeNo)
+	return r.expireResult, r.expireErr
+}
+
 // clonePayment 返回订单副本，避免用例之间通过指针互相影响。
 func clonePayment(item *domainpayment.Payment) *domainpayment.Payment {
 	if item == nil {
@@ -240,15 +277,19 @@ type fakeAlipayGateway struct {
 	precreateResult *domainpayment.PrecreateResult
 	precreateErr    error
 
-	queryResult *domainpayment.TradeQueryResult
-	queryErr    error
+	queryResult  *domainpayment.TradeQueryResult
+	queryResults map[string]*domainpayment.TradeQueryResult
+	queryErr     error
 
 	verifyPayload *domainpayment.NotifyPayload
 	verifyErr     error
 
+	cancelErr error
+
 	precreateCalls []domainpayment.PrecreateRequest
 	queryCalls     []string
 	verifyCalls    []url.Values
+	cancelCalls    []string
 }
 
 func (g *fakeAlipayGateway) Precreate(_ context.Context, req domainpayment.PrecreateRequest) (*domainpayment.PrecreateResult, error) {
@@ -264,7 +305,16 @@ func (g *fakeAlipayGateway) QueryTrade(_ context.Context, outTradeNo string) (*d
 	if g.queryErr != nil {
 		return nil, g.queryErr
 	}
+	if g.queryResults != nil {
+		return g.queryResults[outTradeNo], nil
+	}
 	return g.queryResult, nil
+}
+
+// CancelTrade 记录关单入参并返回注入的故障（缺省成功），用于覆盖收口任务的关单分支。
+func (g *fakeAlipayGateway) CancelTrade(_ context.Context, outTradeNo string) error {
+	g.cancelCalls = append(g.cancelCalls, outTradeNo)
+	return g.cancelErr
 }
 
 func (g *fakeAlipayGateway) VerifyNotify(_ context.Context, form url.Values) (*domainpayment.NotifyPayload, error) {

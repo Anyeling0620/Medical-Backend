@@ -20,6 +20,30 @@ type Config struct {
 	Auth     AuthConfig
 	WeChat   WeChatConfig
 	Alipay   AlipayConfig
+	Worker   WorkerConfig
+}
+
+// WorkerConfig 是进程内后台任务（当前只有订单过期收口任务）的开关与节奏。
+//
+// 收口任务的规则见 04-api-contract.md §6.8 与 创建订单与支付业务说明.md 第 7 节：
+// 每 10~30 秒一轮、进程启动先扫一轮、查询失败重试后仍继续收口。关闭任务会让未付款订单
+// 一直占用号源，因此只在明确知道后果时才应关闭（bootstrap 启动时会输出告警）。
+type WorkerConfig struct {
+	// OrderExpiryEnabled 是订单过期收口任务的开关。
+	OrderExpiryEnabled bool `env:"ORDER_EXPIRY_WORKER_ENABLED" envDefault:"true"`
+	// OrderExpiryInterval 是扫描间隔，缺省 20 秒（规格建议 10~30 秒）。
+	OrderExpiryInterval time.Duration `env:"ORDER_EXPIRY_INTERVAL" envDefault:"20s"`
+	// OrderExpiryBatchSize 是单轮扫描的订单上限。
+	OrderExpiryBatchSize int `env:"ORDER_EXPIRY_BATCH_SIZE" envDefault:"100"`
+	// OrderExpiryQueryAttempts 是单笔订单调用 alipay.trade.query 的最大尝试次数（含首次）；
+	// 超过阈值仍失败时继续收口，保证号源释放不被支付宝可用性阻塞。
+	OrderExpiryQueryAttempts int `env:"ORDER_EXPIRY_QUERY_ATTEMPTS" envDefault:"3"`
+	// OrderExpiryQueryRetryInterval 是两次查询尝试之间的等待间隔。
+	OrderExpiryQueryRetryInterval time.Duration `env:"ORDER_EXPIRY_QUERY_RETRY_INTERVAL" envDefault:"500ms"`
+	// OrderExpiryOrderTimeout 是单笔订单外部调用（查询 + 关单）的总时限。
+	// 必须大于「ORDER_EXPIRY_QUERY_ATTEMPTS × ALIPAY_HTTP_TIMEOUT + 重试等待」并留出一次关单的余量，
+	// 否则重试与关单会被单笔时限掐掉（缺省组合为 3×5s 查询 + 一次 5s 关单，故取 30s）。
+	OrderExpiryOrderTimeout time.Duration `env:"ORDER_EXPIRY_ORDER_TIMEOUT" envDefault:"30s"`
 }
 
 type AppConfig struct {

@@ -229,20 +229,17 @@ func (s *Service) Detail(
 	if !domainpayment.SuccessTradeStatus(result.TradeStatus) {
 		return item, nil
 	}
-	// 与通知路径同一口径：迁移前必须校验金额（契约 §6.6「走与通知完全相同的状态迁移」）。
-	// 金额不一致说明查询结果与本地订单对不上，只告警不迁移，避免错误地标记为已支付。
-	if !domainpayment.AmountEquals(result.TotalAmount, item.Amount) {
-		log.Printf(
-			"告警：支付宝主动查询金额与订单不一致 out_trade_no=%s 查询金额=%s 订单金额=%s，不迁移状态",
-			item.OutTradeNo, result.TotalAmount, item.Amount)
-		return item, nil
-	}
-	// 成功证据：与通知路径共用同一段条件更新，禁止绕过 use case 直接改库（契约 §6.6）。
-	updated, err := s.payments.MarkPaid(ctx, item.OutTradeNo, result.TradeNo)
+	// 与通知路径同一口径：判定成功证据（含金额校验）并走条件更新。实现只有一份
+	// （settleFromTradeQuery），收口任务也用同一段逻辑，禁止各写一套（契约 §6.6、§6.8）。
+	settlement, err := settleFromTradeQuery(ctx, s.payments, item, result)
 	if err != nil {
 		return nil, dataError(err)
 	}
-	if !updated {
+	if !settlement.SuccessEvidence || settlement.AmountMismatch {
+		// 不是支付成功证据，或金额与订单对不上：只告警不迁移，按原状态回显（契约 §6.6）。
+		return item, nil
+	}
+	if !settlement.Migrated {
 		// 条件更新未生效说明状态已被通知路径改写：重新读一次真实状态，不覆盖他人结果。
 		latest, err := s.payments.FindPaymentByOutTradeNo(ctx, item.OutTradeNo, ownerPatientID)
 		if errors.Is(err, domainpayment.ErrPaymentNotFound) {

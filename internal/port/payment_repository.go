@@ -2,6 +2,7 @@ package port
 
 import (
 	"context"
+	"time"
 
 	"Medical-Web-Backend/internal/domain/payment"
 )
@@ -38,4 +39,20 @@ type PaymentRepository interface {
 	// MarkPaid 走 UNPAID -> PAID 的条件更新并写入支付宝交易号，
 	// 返回值表示本次调用是否真正完成了状态迁移（false 表示已被其它路径处理）。
 	MarkPaid(ctx context.Context, outTradeNo string, transactionID string) (bool, error)
+	// ListExpiredUnpaid 按 expire_at 升序返回「已过支付有效期且仍未付款」的订单，
+	// 供 35 分钟收口任务扫描（契约 §6.8、创建订单与支付业务说明.md 第 7 节）。
+	//
+	// 扫描条件固定为 payment_status = 未付款 AND expire_at <= now()，其中 now() 取数据库时钟：
+	// 过期判定必须与建单事务写入三个时间点时使用的时钟一致，不得改用应用进程时间。
+	// limit 是单轮批量上限，小于 1 时按 1 处理；afterExpireAt/afterRegistrationID 是稳定
+	// keyset 游标，零值表示从队首开始，避免金额异常订单长期占满队首导致后续订单饥饿。
+	ListExpiredUnpaid(ctx context.Context, limit int, afterExpireAt time.Time, afterRegistrationID int64) ([]payment.Payment, error)
+	// ExpireUnpaid 执行收口事务：把订单由 UNPAID 条件更新为 EXPIRED（payment_status = 4），
+	// 并仅当条件更新命中（affected = 1）时在**同一事务内**把计划级与时段级 num 各减 1
+	// （带 num > 0 保护）；affected = 0 时整笔回滚，不做任何释放（契约 §6.8）。
+	//
+	// 「条件更新成功」是号源释放的唯一凭据，因此本方法天然幂等：重复扫描只会有一次返回 true，
+	// 不会重复释放、不会把两级 num 减成负数。不新增“号源已释放”标记列。
+	// 返回值表示本次调用是否真正完成了收口（false 表示订单已被通知路径、主动查询或另一实例处理）。
+	ExpireUnpaid(ctx context.Context, outTradeNo string) (bool, error)
 }
