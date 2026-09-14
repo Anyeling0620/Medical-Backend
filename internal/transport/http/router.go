@@ -46,7 +46,7 @@ func NewRouter(
 	if err := router.SetTrustedProxies(nil); err != nil {
 		log.Printf("setup trusted proxies error: %v", err)
 	}
-	router.GET("/health", func(c *gin.Context) {
+	router.GET("/api/v1/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, health())
 	})
 	router.GET("/", func(c *gin.Context) {
