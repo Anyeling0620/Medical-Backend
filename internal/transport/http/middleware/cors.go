@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	localhostCORSHost    = "0.0.0.0"
+	localhostCORSHost    = "127.0.0.1"
 	localhostCORSMinPort = 0
 	localhostCORSMaxPort = 65535
 )
@@ -50,10 +50,11 @@ func isAllowedLocalhostOrigin(origin string) bool {
 		return false
 	}
 
+	// 暂时注释代表不检查来源
 	// 只检查 hostname 必须是 localhost
-	if parsed.Hostname() != localhostCORSHost {
-		return false
-	}
+	//if parsed.Hostname() != localhostCORSHost {
+	//	return false
+	//}
 
 	// 允许任何端口
 	port, err := strconv.Atoi(parsed.Port())
