@@ -9,10 +9,7 @@ RUN go mod download
 
 COPY . .
 
-RUN wget "http://arms-apm-cn-hangzhou.oss-cn-hangzhou.aliyuncs.com/instgo/instgo-linux-amd64" -O instgo && \
-    chmod +x instgo
-
-RUN CGO_ENABLED=0 ./instgo go build -o /out/medical-server ./cmd/server
+RUN CGO_ENABLED=0 go build -o /out/medical-server ./cmd/server
 
 FROM gcr.io/distroless/static-debian12
 COPY --from=build /out/medical-server /medical-server
