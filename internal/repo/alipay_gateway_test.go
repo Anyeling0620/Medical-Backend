@@ -39,6 +39,19 @@ func alipayTestKeyPair(t *testing.T) (*rsa.PrivateKey, *rsa.PublicKey) {
 	return key, &key.PublicKey
 }
 
+// TestAlipayGatewayReadyRejectsInvalidPrivateKey 覆盖后台任务启动前的就绪检查：
+// 非空但无法解析的私钥仍属于无效配置，不能让收口任务启动后按运行期故障继续释放号源。
+func TestAlipayGatewayReadyRejectsInvalidPrivateKey(t *testing.T) {
+	gateway := NewAlipayGateway(AlipayOptions{
+		AppID:      "test-app",
+		PrivateKey: "not-a-private-key",
+		GatewayURL: "https://example.invalid/gateway.do",
+	})
+	if err := gateway.Ready(); !errors.Is(err, port.ErrAlipayUnavailable) {
+		t.Fatalf("无效私钥的 Ready 错误 = %v，期望 ErrAlipayUnavailable", err)
+	}
+}
+
 // alipayTestPrivateKeyBase64 把私钥编码为裸 base64（PKCS#8），与支付宝开放平台复制出来的格式一致。
 func alipayTestPrivateKeyBase64(t *testing.T, key *rsa.PrivateKey) string {
 	t.Helper()
@@ -409,5 +422,110 @@ func TestAlipayGatewayQueryTradeNotExist(t *testing.T) {
 	}
 	if result.OutTradeNo != "202609080001" {
 		t.Fatalf("out_trade_no = %q，期望回显请求值", result.OutTradeNo)
+	}
+}
+
+// ---- 关单（alipay.trade.cancel） ----
+
+// TestAlipayGatewayCancelTradeSuccess 覆盖关单成功：code=10000 时返回 nil；同时断言发出去的
+// 请求 method 是 alipay.trade.cancel、biz_content 带 out_trade_no，并用请求方公钥自验签名，
+// 证明关单复用了预下单/主动查询同一套「公共参数 + biz_content + RSA2 签名」口径（契约 §6.8）。
+func TestAlipayGatewayCancelTradeSuccess(t *testing.T) {
+	appKey, appPublicKey := alipayTestKeyPair(t)
+	alipayKey, alipayPublicKey := alipayTestKeyPair(t)
+	server := alipayTestServer(t, alipayTestServerOptions{
+		signKey: alipayKey,
+		payloads: map[string]string{
+			"alipay.trade.cancel": `{"code":"10000","msg":"Success","out_trade_no":"202609080001","trade_no":"2026090822001456789012"}`,
+		},
+	})
+	defer server.Close()
+
+	gateway := alipayTestGateway(t, server.URL, appKey, alipayPublicKey)
+	if err := gateway.CancelTrade(context.Background(), "202609080001"); err != nil {
+		t.Fatalf("关单成功期望返回 nil，实际 %T：%v", err, err)
+	}
+
+	requests := server.Requests()
+	if len(requests) != 1 {
+		t.Fatalf("假网关收到的请求数 = %d，期望 1", len(requests))
+	}
+	form := requests[0]
+	if form.Get("method") != "alipay.trade.cancel" {
+		t.Fatalf("method = %q，期望 alipay.trade.cancel", form.Get("method"))
+	}
+	if !strings.Contains(form.Get("biz_content"), `"out_trade_no":"202609080001"`) {
+		t.Fatalf("biz_content = %q，期望包含 out_trade_no", form.Get("biz_content"))
+	}
+	if form.Get("sign_type") != "RSA2" || form.Get("sign") == "" {
+		t.Fatalf("关单请求必须带 sign_type=RSA2 与非空 sign，实际 sign_type=%q sign=%q",
+			form.Get("sign_type"), form.Get("sign"))
+	}
+	if err := verifyRSA2(appPublicKey, buildRequestSignContent(alipayTestFormToParams(form)), form.Get("sign")); err != nil {
+		t.Fatalf("关单请求签名自验失败：%v", err)
+	}
+}
+
+// TestAlipayGatewayCancelTradeErrorMapping 覆盖关单业务错误码映射（契约 §6.8）：
+// ACQ.TRADE_HAS_CLOSE / ACQ.TRADE_HAS_SUCCESS 是不可重试的冲突（ErrAlipayTradeClosed，
+// 收口任务据此判定「支付宝侧已不可支付」），其余 sub_code 与 code != 10000 一律按可重试的
+// 服务不可用处理（ErrAlipayUnavailable），两类都必须能被 errors.Is 判定。
+func TestAlipayGatewayCancelTradeErrorMapping(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    error
+	}{
+		{
+			name:    "ACQ.TRADE_HAS_CLOSE",
+			payload: `{"code":"40004","msg":"Business Failed","sub_code":"ACQ.TRADE_HAS_CLOSE","sub_msg":"交易已经关闭"}`,
+			want:    port.ErrAlipayTradeClosed,
+		},
+		{
+			name:    "ACQ.TRADE_HAS_SUCCESS",
+			payload: `{"code":"40004","msg":"Business Failed","sub_code":"ACQ.TRADE_HAS_SUCCESS","sub_msg":"交易已支付成功"}`,
+			want:    port.ErrAlipayTradeClosed,
+		},
+		{
+			name:    "未知 sub_code",
+			payload: `{"code":"40004","msg":"Business Failed","sub_code":"ACQ.UNKNOWN","sub_msg":"未知业务失败"}`,
+			want:    port.ErrAlipayUnavailable,
+		},
+		{
+			name:    "系统级错误 code=20000",
+			payload: `{"code":"20000","msg":"Service Currently Unavailable","sub_code":"aop.unknownerror"}`,
+			want:    port.ErrAlipayUnavailable,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			appKey, _ := alipayTestKeyPair(t)
+			alipayKey, alipayPublicKey := alipayTestKeyPair(t)
+			server := alipayTestServer(t, alipayTestServerOptions{
+				signKey:  alipayKey,
+				payloads: map[string]string{"alipay.trade.cancel": tc.payload},
+			})
+			defer server.Close()
+
+			gateway := alipayTestGateway(t, server.URL, appKey, alipayPublicKey)
+			err := gateway.CancelTrade(context.Background(), "202609080001")
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("关单期望错误链包含 %v，实际 %T：%v", tc.want, err, err)
+			}
+			// 反向保护：服务不可用不得被误判为「交易已关闭」，否则收口会漏掉关单动作。
+			if tc.want == port.ErrAlipayUnavailable && errors.Is(err, port.ErrAlipayTradeClosed) {
+				t.Fatalf("关单错误不得被判定为交易已关闭：%v", err)
+			}
+		})
+	}
+}
+
+// TestAlipayGatewayCancelTradeWithoutCredentialsIsUnavailable 未配置凭据时不发起网络请求，
+// 直接返回 ErrAlipayUnavailable（与预下单/主动查询同一降级口径）。
+func TestAlipayGatewayCancelTradeWithoutCredentialsIsUnavailable(t *testing.T) {
+	gateway := NewAlipayGateway(AlipayOptions{GatewayURL: "http://127.0.0.1:1/gateway.do"})
+
+	if err := gateway.CancelTrade(context.Background(), "202609080001"); !errors.Is(err, port.ErrAlipayUnavailable) {
+		t.Fatalf("未配置凭据时关单期望 ErrAlipayUnavailable，实际 %T：%v", err, err)
 	}
 }

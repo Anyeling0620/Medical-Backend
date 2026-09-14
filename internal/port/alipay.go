@@ -39,6 +39,16 @@ type AlipayGateway interface {
 	// 交易不存在（ACQ.TRADE_NOT_EXIST）不是错误：返回 TradeStatus 为空的结果；
 	// 未配置凭据、网络失败或系统级错误返回 ErrAlipayUnavailable。
 	QueryTrade(ctx context.Context, outTradeNo string) (*payment.TradeQueryResult, error)
+	// CancelTrade 调用 alipay.trade.cancel 关闭支付宝侧交易。
+	//
+	// 收口任务在「订单已过 expire_at、查询结果为 WAIT_BUYER_PAY（支付宝侧仍可支付）」时调用它，
+	// 避免用户在本地的收口边界之后仍然付款成功（契约 §6.8、创建订单与支付业务说明.md 第 7 节）。
+	//
+	// 关单是尽力而为的动作：调用方在失败时仍必须继续执行收口事务，不允许因为支付宝不可用
+	// 让号源被永久占用，因此实现不做内部重试，只把失败按下面两类返回：
+	// 交易已关闭或已成功返回 ErrAlipayTradeClosed（不可重试的冲突）；
+	// 未配置凭据、网络失败、系统级错误或其它业务码拒绝返回 ErrAlipayUnavailable。
+	CancelTrade(ctx context.Context, outTradeNo string) error
 	// VerifyNotify 校验异步通知的 RSA2 签名与身份（app_id、seller_id）。
 	//
 	// 验签失败返回 ErrNotifySignatureInvalid，身份不一致返回 ErrNotifyIdentityMismatch；

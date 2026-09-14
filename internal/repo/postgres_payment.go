@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"Medical-Web-Backend/internal/domain/payment"
 	domainregistration "Medical-Web-Backend/internal/domain/registration"
@@ -171,6 +172,158 @@ func (r *PostgresPaymentRepository) MarkPaid(
 		return false, err
 	}
 	return affected == 1, nil
+}
+
+// expiredUnpaidQuery 是收口任务的扫描语句（契约 §6.8、创建订单与支付业务说明.md 第 7 节）：
+// 条件固定为 payment_status = 未付款 AND expire_at <= now()，now() 取数据库时钟，
+// 与建单事务写入三个时间点时使用的时钟一致，不得改用应用进程时间。
+// 按 expire_at 升序处理，让滞留最久的订单先被收敛；expire_at 为空的历史脏数据不参与扫描，
+// 避免在无法判定过期的情况下释放号源；out_trade_no 为空的历史脏数据同样不参与扫描——
+// 收口事务按 out_trade_no 定位（空串会一次命中所有空交易号行），不能让它们进入释放路径。
+const expiredUnpaidQuery = `SELECT ` + paymentColumns + ` FROM hospital.medical_registration r
+WHERE r.payment_status = $1 AND r.expire_at IS NOT NULL AND r.expire_at <= now()
+  AND btrim(r.out_trade_no) <> ''
+ORDER BY r.expire_at, r.id
+LIMIT $2`
+
+const expiredUnpaidAfterQuery = `SELECT ` + paymentColumns + ` FROM hospital.medical_registration r
+WHERE r.payment_status = $1 AND r.expire_at IS NOT NULL AND r.expire_at <= now()
+  AND btrim(r.out_trade_no) <> ''
+  AND (r.expire_at > $3 OR (r.expire_at = $3 AND r.id > $4))
+ORDER BY r.expire_at, r.id
+LIMIT $2`
+
+// ListExpiredUnpaid 按 expire_at 升序返回「已过支付有效期且仍未付款」的订单。
+func (r *PostgresPaymentRepository) ListExpiredUnpaid(
+	ctx context.Context,
+	limit int,
+	afterExpireAt time.Time,
+	afterRegistrationID int64,
+) ([]payment.Payment, error) {
+	if r == nil || r.db == nil {
+		return nil, sql.ErrConnDone
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	query := expiredUnpaidQuery
+	args := []any{domainregistration.PaymentCodeUnpaid, limit}
+	if !afterExpireAt.IsZero() {
+		query = expiredUnpaidAfterQuery
+		args = append(args, afterExpireAt, afterRegistrationID)
+	}
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	items := make([]payment.Payment, 0, limit)
+	for rows.Next() {
+		item, err := r.scanPayment(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, *item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+// expireTargetQuery 读取收口所需的关联编号并锁住该挂号行（FOR UPDATE）：
+// work_plan_id 与 doctor_schedule_id 用于把两级 num 各减 1。加锁顺序与
+// CompensateRegistration 一致（先锁挂号行，再按「父计划 -> 时段」更新计数器），避免互相死锁。
+const expireTargetQuery = `SELECT work_plan_id, doctor_schedule_id
+FROM hospital.medical_registration
+WHERE btrim(out_trade_no) = btrim($1) FOR UPDATE`
+
+// expireUnpaidQuery 是收口事务的状态迁移语句：$1 out_trade_no、$2 目标状态（已过期）、
+// $3 前置状态（未付款）。条件 payment_status = 未付款 是「需要释放且只释放一次」的唯一凭据：
+// 不新增“号源已释放”标记列，重复执行时 affected = 0，不会重复释放（契约 §6.8）。
+const expireUnpaidQuery = `UPDATE hospital.medical_registration
+SET payment_status = $2
+WHERE btrim(out_trade_no) = btrim($1) AND payment_status = $3`
+
+// ExpireUnpaid 执行收口事务：条件更新置 EXPIRED，命中后在**同一事务内**释放两级号源。
+//
+// 释放语句复用挂号域的两条 release*Query（带 num > 0 保护），保证「收口、建单失败补偿、
+// 退款、用户取消」四条释放路径共用同一段实现（创建订单与支付业务说明.md 第 4 节）。
+// 条件更新未命中说明订单已被通知路径、主动查询或另一实例处理，整笔回滚、不做任何释放。
+func (r *PostgresPaymentRepository) ExpireUnpaid(ctx context.Context, outTradeNo string) (bool, error) {
+	if r == nil || r.db == nil {
+		return false, sql.ErrConnDone
+	}
+	// 防御：空 out_trade_no 会命中所有空交易号的脏数据行，直接按「无需收口」拒绝。
+	// 建单路径保证 out_trade_no 非空，因此正常订单不会走到这里。
+	if strings.TrimSpace(outTradeNo) == "" {
+		return false, nil
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	// 提交成功后 Rollback 返回 sql.ErrTxDone，按惯例忽略即可。
+	defer func() { _ = tx.Rollback() }()
+
+	var workPlanID, scheduleID sql.NullInt64
+	err = tx.QueryRowContext(ctx, expireTargetQuery, outTradeNo).Scan(&workPlanID, &scheduleID)
+	if errors.Is(err, sql.ErrNoRows) {
+		// 记录已不存在（重复补偿或已清理）：按「无需收口」返回，不做任何释放。
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	// 两级号源必须同进同退：关联编号缺失（脏数据）时无法把两边各减 1，
+	// 宁可整笔回滚——订单保持 UNPAID，下一轮重试并输出告警——也不能只减其中一边。
+	if !workPlanID.Valid || workPlanID.Int64 < 1 || !scheduleID.Valid || scheduleID.Int64 < 1 {
+		return false, fmt.Errorf("收口订单缺少排班关联，拒绝只减一级号源 out_trade_no=%s", outTradeNo)
+	}
+
+	updated, err := tx.ExecContext(ctx, expireUnpaidQuery, outTradeNo,
+		domainregistration.PaymentCodeExpired, domainregistration.PaymentCodeUnpaid)
+	if err != nil {
+		return false, err
+	}
+	affected, err := updated.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, nil
+	}
+	if affected != 1 {
+		return false, fmt.Errorf("收口状态更新命中 %d 行，期望恰好 1 行 out_trade_no=%s", affected, outTradeNo)
+	}
+
+	// 同一事务内释放两级号源：只有条件更新命中才会走到这里，因此释放只可能发生一次。
+	planResult, err := tx.ExecContext(ctx, releasePlanQuotaQuery, workPlanID.Int64)
+	if err != nil {
+		return false, err
+	}
+	planAffected, err := planResult.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if planAffected != 1 {
+		return false, fmt.Errorf("计划级号源释放命中 %d 行，期望恰好 1 行 work_plan_id=%d", planAffected, workPlanID.Int64)
+	}
+	slotResult, err := tx.ExecContext(ctx, releaseSlotQuotaQuery, scheduleID.Int64)
+	if err != nil {
+		return false, err
+	}
+	slotAffected, err := slotResult.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if slotAffected != 1 {
+		return false, fmt.Errorf("时段级号源释放命中 %d 行，期望恰好 1 行 schedule_id=%d", slotAffected, scheduleID.Int64)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // transactionIDParam 把空的支付宝交易号转换为 NULL：契约要求未支付时 transactionId 为 null，
