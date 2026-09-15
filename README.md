@@ -1,6 +1,6 @@
 # Medical-Web-Backend
 
-管理端（Web）与患者端（小程序）共用的统一 Go API 服务，接口契约以
+管理端（Web）、患者端（小程序）与匿名公开查询共用的统一 Go API 服务，接口契约以
 [spec/04-api-contract.md](../spec/04-api-contract.md) 为准。
 
 本文只讲两件事：**怎么部署**、**出问题怎么查**。
