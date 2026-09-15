@@ -11,7 +11,11 @@ COPY . .
 
 RUN CGO_ENABLED=0 go build -o /out/medical-server ./cmd/server
 
-FROM gcr.io/distroless/static-debian12
+FROM scratch
+
+# 复制根证书，保证调用支付宝、微信等 HTTPS 服务时能够完成 TLS 校验。
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/medical-server /medical-server
+
 EXPOSE 9080
 ENTRYPOINT ["/medical-server"]
